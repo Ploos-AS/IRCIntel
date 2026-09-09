@@ -15,7 +15,7 @@ import (
 )
 
 const observationTimeLayout = "2006-01-02T15:04:05.000000000Z"
-const sqliteSchemaVersion = 4
+const sqliteSchemaVersion = 5
 
 type SQLiteStore struct { db *sql.DB }
 
@@ -138,6 +138,14 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_observations_identity
 	// which are unsafe for SQLite's lexical ordering and range filtering.
 	if version == 3 {
 		if err := s.runMigration(4, normalizeNetworkIncidentTimesTx); err != nil { return err }
+		version = 4
+	}
+
+	// M3.28 persists the latest reachability state for every agent+endpoint tuple.
+	// Existing databases are backfilled from their newest observation per tuple so
+	// the next milestone can derive transitions without replaying old observations.
+	if version == 4 {
+		if err := s.runMigration(5, migrateAgentEndpointStateTx); err != nil { return err }
 	}
 	return nil
 }
@@ -205,6 +213,7 @@ func (s *SQLiteStore) Store(observation agent.Observation) error {
 	rows,err:=result.RowsAffected();if err!=nil{return err};if rows==0{return tx.Commit()}
 	if err:=refreshIncidentRecordsTx(tx);err!=nil{return err}
 	if err:=refreshNetworkIncidentRecordsTx(tx);err!=nil{return err}
+	if err:=upsertAgentEndpointStateTx(tx,observation);err!=nil{return err}
 	return tx.Commit()
 }
 
