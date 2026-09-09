@@ -1,6 +1,7 @@
 package core
 
 import (
+	"encoding/json"
 	"path/filepath"
 	"testing"
 	"time"
@@ -22,6 +23,23 @@ func TestSQLiteStorePersistsObservations(t *testing.T) {
 	count, err := reopened.Count()
 	if err != nil { t.Fatal(err) }
 	if count != 1 { t.Fatalf("count=%d", count) }
+}
+
+func TestSQLiteStoreDeduplicatesObservationRetries(t *testing.T) {
+	store, err := OpenSQLiteStore(filepath.Join(t.TempDir(), "ircintel.db"))
+	if err != nil { t.Fatal(err) }
+	defer store.Close()
+	observation := agent.Observation{
+		AgentID: "oslo-1",
+		ObservedAt: time.Date(2026, 9, 9, 12, 0, 0, 123_000_000, time.UTC),
+		Endpoint: agent.Endpoint{Host: "irc.example", Port: "6697", TLS: true},
+		Result: probe.EndpointResult{Reachable: true},
+	}
+	if err := store.Store(observation); err != nil { t.Fatal(err) }
+	if err := store.Store(observation); err != nil { t.Fatal(err) }
+	count, err := store.Count()
+	if err != nil { t.Fatal(err) }
+	if count != 1 { t.Fatalf("count=%d want=1", count) }
 }
 
 func TestFormatObservationTimeIsFixedWidthUTC(t *testing.T) {
@@ -90,13 +108,14 @@ func TestSQLiteStoreDoesNotRepeatV1DataMigration(t *testing.T) {
 	if stored != legacy { t.Fatalf("v1 database was unexpectedly rescanned: stored=%q want=%q", stored, legacy) }
 }
 
-func TestSQLiteStoreV1ToV2CreatesDiscoverySchemas(t *testing.T) {
+func TestSQLiteStoreV1MigrationCreatesDiscoverySchemas(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "ircintel.db")
 	store, err := OpenSQLiteStore(path)
 	if err != nil { t.Fatal(err) }
 	for _, table := range []string{"discovery_candidates", "discovery_reviews", "discovery_promotions"} {
 		if _, err := store.db.Exec(`DROP TABLE IF EXISTS ` + table); err != nil { t.Fatal(err) }
 	}
+	if _, err := store.db.Exec(`DROP INDEX IF EXISTS idx_observations_identity`); err != nil { t.Fatal(err) }
 	if _, err := store.db.Exec(`PRAGMA user_version = 1`); err != nil { t.Fatal(err) }
 	if err := store.Close(); err != nil { t.Fatal(err) }
 
@@ -105,12 +124,45 @@ func TestSQLiteStoreV1ToV2CreatesDiscoverySchemas(t *testing.T) {
 	defer reopened.Close()
 	var version int
 	if err := reopened.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil { t.Fatal(err) }
-	if version != 2 { t.Fatalf("user_version=%d want=2", version) }
+	if version != sqliteSchemaVersion { t.Fatalf("user_version=%d want=%d", version, sqliteSchemaVersion) }
 	for _, table := range []string{"discovery_candidates", "discovery_reviews", "discovery_promotions"} {
 		var count int
 		if err := reopened.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?`, table).Scan(&count); err != nil { t.Fatal(err) }
-		if count != 1 { t.Fatalf("table %s missing after v1->v2 migration", table) }
+		if count != 1 { t.Fatalf("table %s missing after migration", table) }
 	}
+}
+
+func TestSQLiteStoreV2ToV3DeduplicatesLegacyObservations(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ircintel.db")
+	store, err := OpenSQLiteStore(path)
+	if err != nil { t.Fatal(err) }
+	observation := agent.Observation{
+		AgentID: "oslo-1",
+		ObservedAt: time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC),
+		Endpoint: agent.Endpoint{Host: "irc.example", Port: "6697", TLS: true},
+		Result: probe.EndpointResult{Reachable: true},
+	}
+	if err := store.Store(observation); err != nil { t.Fatal(err) }
+	payload, err := json.Marshal(observation)
+	if err != nil { t.Fatal(err) }
+	if _, err := store.db.Exec(`DROP INDEX idx_observations_identity`); err != nil { t.Fatal(err) }
+	if _, err := store.db.Exec(`INSERT INTO observations (agent_id, observed_at, endpoint_host, endpoint_port, endpoint_tls, payload_json) VALUES (?, ?, ?, ?, ?, ?)`, observation.AgentID, formatObservationTime(observation.ObservedAt), observation.Endpoint.Host, observation.Endpoint.Port, observation.Endpoint.TLS, payload); err != nil { t.Fatal(err) }
+	if _, err := store.db.Exec(`PRAGMA user_version = 2`); err != nil { t.Fatal(err) }
+	if err := store.Close(); err != nil { t.Fatal(err) }
+
+	reopened, err := OpenSQLiteStore(path)
+	if err != nil { t.Fatal(err) }
+	defer reopened.Close()
+	count, err := reopened.Count()
+	if err != nil { t.Fatal(err) }
+	if count != 1 { t.Fatalf("count=%d want=1", count) }
+	var version int
+	if err := reopened.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil { t.Fatal(err) }
+	if version != 3 { t.Fatalf("user_version=%d want=3", version) }
+	if err := reopened.Store(observation); err != nil { t.Fatal(err) }
+	count, err = reopened.Count()
+	if err != nil { t.Fatal(err) }
+	if count != 1 { t.Fatalf("count after retry=%d want=1", count) }
 }
 
 func TestSQLiteStoreRejectsFutureSchemaVersion(t *testing.T) {
