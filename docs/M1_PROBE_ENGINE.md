@@ -14,10 +14,11 @@ A probe performs, in order:
 6. IRC registration using a clearly identified probe identity.
 7. IRCv3 capability discovery with `CAP LS 302`, including multiline responses and `CAP END`.
 8. Registration-time `PING` handling with corresponding `PONG`.
-9. Successful-registration detection from numeric `001`.
-10. Clean `QUIT` after the measurement.
+9. Passive capture of public registration metadata from numerics such as `004` and `005 ISUPPORT`.
+10. Successful-registration detection from numeric `001`.
+11. Clean `QUIT` after the measurement.
 
-The structured result records all resolved addresses, the selected address, the requested/normalized address family, stage latencies, TLS metadata when applicable, the responding server name and advertised IRCv3 capabilities.
+The structured result records all resolved addresses, the selected address, the requested/normalized address family, stage latencies, TLS metadata when applicable, the responding server name, advertised IRCv3 capabilities, and public server metadata announced during registration.
 
 ## Address-family behavior
 
@@ -56,6 +57,18 @@ Probe-stage failures use stable machine-readable codes instead of requiring cons
 
 Each classified error also carries a stable stage such as `config`, `dns`, `address_selection`, `tcp`, `tls`, or `irc_registration`. Human-readable error text remains available for diagnostics, but aggregation and incident detection should use the stable code/stage fields.
 
+## IRC server metadata
+
+M1.7 records only metadata the server already announces during the normal registration exchange. No additional WHO, WHOIS, LIST, STATS, LINKS, or channel/user enumeration is performed.
+
+`ServerMetadata` currently captures:
+
+- `network` from the `NETWORK=` ISUPPORT token when present.
+- `software` and `software_version` from numeric `004` when supplied by the server.
+- the complete public `005 ISUPPORT` token map, including values such as `CHANTYPES`, `PREFIX`, `CASEMAPPING`, `CHANMODES`, `NICKLEN`, `TOPICLEN`, and similar implementation-advertised features.
+
+ISUPPORT is stored as key/value data so later core components can compare protocol features across networks without parsing raw IRC lines. Missing metadata remains absent rather than guessed.
+
 ## Safety and privacy
 
 The M1 probe does not join channels and does not collect `PRIVMSG`, `NOTICE`, channel messages, user histories or credentials. It performs only the minimum protocol exchange needed to measure a public IRC endpoint.
@@ -71,6 +84,8 @@ Address-family qualification covers explicit IPv4 selection/dialing and an expli
 Endpoint-model qualification covers mixed-family outcomes and verifies that one successful family keeps the endpoint reachable while `dual_stack_ok` remains false. It also verifies that the parent endpoint measurement consumes one host rate-limit slot.
 
 Failure-taxonomy qualification locks stable code/stage mappings for address-selection and TCP failures and verifies that endpoint family observations expose those fields.
+
+Server-metadata qualification verifies deterministic parsing of numeric `004`, `005 ISUPPORT`, `NETWORK=`, and the structured ISUPPORT map, plus end-to-end capture during a synthetic registration exchange.
 
 CI must continue to pass `go test ./...`, `go vet ./...`, the application build, and the M0.1 OCI runtime gate.
 
