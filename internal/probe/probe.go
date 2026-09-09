@@ -50,6 +50,8 @@ type Result struct {
 	ServerMetadata    *ServerMetadata `json:"server_metadata,omitempty"`
 }
 
+type dialContextFunc func(context.Context, string, string) (net.Conn, error)
+
 func (r *Runner) Run(ctx context.Context, cfg Config) (Result, error) {
 	if cfg.Host == "" { return Result{}, probeError(CodeInvalidConfig, "config", errors.New("probe host is required")) }
 	if err := r.authorize(cfg.Host); err != nil { return Result{Host: cfg.Host}, err }
@@ -80,24 +82,11 @@ func (r *Runner) Run(ctx context.Context, cfg Config) (Result, error) {
 	}
 
 	connectStart := time.Now()
-	var conn net.Conn
-	var lastDialErr error
-	for _, selected := range candidates {
-		addr := net.JoinHostPort(selected, cfg.Port)
-		attempt, dialErr := (&net.Dialer{}).DialContext(ctx, network, addr)
-		if dialErr != nil {
-			lastDialErr = dialErr
-			continue
-		}
-		conn = attempt
-		result.SelectedAddress = selected
-		break
-	}
+	dialer := &net.Dialer{}
+	conn, selected, err := dialCandidates(ctx, network, cfg.Port, candidates, dialer.DialContext)
 	result.ConnectLatencyMS = time.Since(connectStart).Milliseconds()
-	if conn == nil {
-		if lastDialErr == nil { lastDialErr = errors.New("all candidate addresses failed") }
-		return result, probeError(CodeTCPConnectFailed, "tcp", lastDialErr)
-	}
+	if err != nil { return result, probeError(CodeTCPConnectFailed, "tcp", err) }
+	result.SelectedAddress = selected
 	defer conn.Close()
 
 	if cfg.TLS {
@@ -165,6 +154,20 @@ func (r *Runner) Run(ctx context.Context, cfg Config) (Result, error) {
 	}
 	if err := scanner.Err(); err != nil { return result, probeError(CodeIRCReadFailed, "irc_registration", err) }
 	return result, probeError(CodeIRCRegistrationFailed, "irc_registration", errors.New("connection closed before IRC registration completed"))
+}
+
+func dialCandidates(ctx context.Context, network, port string, candidates []string, dial dialContextFunc) (net.Conn, string, error) {
+	var lastErr error
+	for _, selected := range candidates {
+		conn, err := dial(ctx, network, net.JoinHostPort(selected, port))
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		return conn, selected, nil
+	}
+	if lastErr == nil { lastErr = errors.New("all candidate addresses failed") }
+	return nil, "", lastErr
 }
 
 func normalizeFamily(family string) (string, string, error) {
