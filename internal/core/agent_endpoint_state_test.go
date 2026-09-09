@@ -108,5 +108,5 @@ VALUES (?, ?, ?, ?, ?, ?)`, observation.AgentID, formatObservationTime(observati
 	}
 	var version int
 	if err := store.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil { t.Fatal(err) }
-	if version != 5 { t.Fatalf("user_version=%d want=5", version) }
+	if version != sqliteSchemaVersion { t.Fatalf("user_version=%d want=%d", version, sqliteSchemaVersion) }
 }
