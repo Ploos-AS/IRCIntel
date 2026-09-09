@@ -50,14 +50,14 @@ type Result struct {
 }
 
 func (r *Runner) Run(ctx context.Context, cfg Config) (Result, error) {
-	if cfg.Host == "" { return Result{}, errors.New("probe host is required") }
+	if cfg.Host == "" { return Result{}, probeError(CodeInvalidConfig, "config", errors.New("probe host is required")) }
 	if err := r.authorize(cfg.Host); err != nil { return Result{Host: cfg.Host}, err }
 	if cfg.Port == "" {
 		if cfg.TLS { cfg.Port = "6697" } else { cfg.Port = "6667" }
 	}
 	if cfg.Timeout <= 0 { cfg.Timeout = 10 * time.Second }
 	family, network, err := normalizeFamily(cfg.Family)
-	if err != nil { return Result{Host: cfg.Host, Port: cfg.Port, TLS: cfg.TLS}, err }
+	if err != nil { return Result{Host: cfg.Host, Port: cfg.Port, TLS: cfg.TLS}, probeError(CodeInvalidConfig, "config", err) }
 
 	ctx, cancel := context.WithTimeout(ctx, cfg.Timeout)
 	defer cancel()
@@ -66,19 +66,24 @@ func (r *Runner) Run(ctx context.Context, cfg Config) (Result, error) {
 	dnsStart := time.Now()
 	ips, err := net.DefaultResolver.LookupHost(ctx, cfg.Host)
 	result.DNSLatencyMS = time.Since(dnsStart).Milliseconds()
-	if err != nil { return result, fmt.Errorf("dns lookup: %w", err) }
+	if err != nil { return result, probeError(CodeDNSLookupFailed, "dns", err) }
 	sort.Strings(ips)
 	result.ResolvedAddresses = ips
 
 	selected, err := selectAddress(ips, family)
-	if err != nil { return result, err }
+	if err != nil {
+		code := CodeNoAddress
+		if family == "ipv4" { code = CodeNoIPv4Address }
+		if family == "ipv6" { code = CodeNoIPv6Address }
+		return result, probeError(code, "address_selection", err)
+	}
 	result.SelectedAddress = selected
 
 	addr := net.JoinHostPort(selected, cfg.Port)
 	connectStart := time.Now()
 	conn, err := (&net.Dialer{}).DialContext(ctx, network, addr)
 	result.ConnectLatencyMS = time.Since(connectStart).Milliseconds()
-	if err != nil { return result, fmt.Errorf("tcp connect: %w", err) }
+	if err != nil { return result, probeError(CodeTCPConnectFailed, "tcp", err) }
 	defer conn.Close()
 
 	if cfg.TLS {
@@ -86,7 +91,7 @@ func (r *Runner) Run(ctx context.Context, cfg Config) (Result, error) {
 		if serverName == "" { serverName = cfg.Host }
 		tlsConn := tls.Client(conn, &tls.Config{ServerName: serverName, MinVersion: tls.VersionTLS12})
 		tlsStart := time.Now()
-		if err := tlsConn.HandshakeContext(ctx); err != nil { return result, fmt.Errorf("tls handshake: %w", err) }
+		if err := tlsConn.HandshakeContext(ctx); err != nil { return result, probeError(CodeTLSHandshakeFailed, "tls", err) }
 		result.TLSLatencyMS = time.Since(tlsStart).Milliseconds()
 		metadata := metadataFromTLSState(tlsConn.ConnectionState())
 		result.TLSMetadata = &metadata
@@ -101,7 +106,7 @@ func (r *Runner) Run(ctx context.Context, cfg Config) (Result, error) {
 
 	registrationStart := time.Now()
 	if _, err := fmt.Fprintf(conn, "CAP LS 302\r\nNICK %s\r\nUSER %s 0 * :%s\r\n", r.identity.Nick, r.identity.Username, realname); err != nil {
-		return result, fmt.Errorf("irc registration write: %w", err)
+		return result, probeError(CodeIRCRegistrationWrite, "irc_registration", err)
 	}
 
 	scanner := bufio.NewScanner(conn)
@@ -116,7 +121,7 @@ func (r *Runner) Run(ctx context.Context, cfg Config) (Result, error) {
 		if strings.HasPrefix(line, "PING ") {
 			payload := strings.TrimSpace(strings.TrimPrefix(line, "PING"))
 			if payload == "" { payload = ":" }
-			if _, err := fmt.Fprintf(conn, "PONG %s\r\n", payload); err != nil { return result, fmt.Errorf("irc pong write: %w", err) }
+			if _, err := fmt.Fprintf(conn, "PONG %s\r\n", payload); err != nil { return result, probeError(CodeIRCPongWrite, "irc_registration", err) }
 			continue
 		}
 
@@ -125,7 +130,7 @@ func (r *Runner) Run(ctx context.Context, cfg Config) (Result, error) {
 				for _, capability := range strings.Fields(line[idx+2:]) { caps[capability] = struct{}{} }
 			}
 			if !capLSContinues(parts, capIdx) && !capEnded {
-				if _, err := fmt.Fprint(conn, "CAP END\r\n"); err != nil { return result, fmt.Errorf("irc cap end write: %w", err) }
+				if _, err := fmt.Fprint(conn, "CAP END\r\n"); err != nil { return result, probeError(CodeIRCCapEndWrite, "irc_registration", err) }
 				capEnded = true
 			}
 		}
@@ -138,8 +143,8 @@ func (r *Runner) Run(ctx context.Context, cfg Config) (Result, error) {
 			return result, nil
 		}
 	}
-	if err := scanner.Err(); err != nil { return result, fmt.Errorf("irc read: %w", err) }
-	return result, errors.New("connection closed before IRC registration completed")
+	if err := scanner.Err(); err != nil { return result, probeError(CodeIRCReadFailed, "irc_registration", err) }
+	return result, probeError(CodeIRCRegistrationFailed, "irc_registration", errors.New("connection closed before IRC registration completed"))
 }
 
 func normalizeFamily(family string) (string, string, error) {
@@ -172,10 +177,7 @@ func selectAddress(addresses []string, family string) (string, error) {
 }
 
 func metadataFromTLSState(state tls.ConnectionState) TLSMetadata {
-	metadata := TLSMetadata{
-		Version:     tlsVersionName(state.Version),
-		CipherSuite: tls.CipherSuiteName(state.CipherSuite),
-	}
+	metadata := TLSMetadata{Version: tlsVersionName(state.Version), CipherSuite: tls.CipherSuiteName(state.CipherSuite)}
 	if len(state.PeerCertificates) == 0 { return metadata }
 	populateCertificateMetadata(&metadata, state.PeerCertificates[0])
 	return metadata
@@ -194,16 +196,11 @@ func populateCertificateMetadata(metadata *TLSMetadata, cert *x509.Certificate) 
 
 func tlsVersionName(version uint16) string {
 	switch version {
-	case tls.VersionTLS13:
-		return "TLS 1.3"
-	case tls.VersionTLS12:
-		return "TLS 1.2"
-	case tls.VersionTLS11:
-		return "TLS 1.1"
-	case tls.VersionTLS10:
-		return "TLS 1.0"
-	default:
-		return fmt.Sprintf("0x%04x", version)
+	case tls.VersionTLS13: return "TLS 1.3"
+	case tls.VersionTLS12: return "TLS 1.2"
+	case tls.VersionTLS11: return "TLS 1.1"
+	case tls.VersionTLS10: return "TLS 1.0"
+	default: return fmt.Sprintf("0x%04x", version)
 	}
 }
 
