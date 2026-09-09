@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/Ploos-AS/IRCIntel/internal/agent"
 )
@@ -103,8 +104,54 @@ ORDER BY observed_at DESC, id DESC`, host, port, tls)
 	return decodeObservationRowsTx(rows)
 }
 
-func observationsForEndpointSinceTx(tx *sql.Tx, host, port string, tls bool, anchorTime interface{ UTC() interface{} }) ([]agent.Observation, error) {
-	return nil, nil
+func observationsForEndpointSinceTx(tx *sql.Tx, host, port string, tls bool, anchor time.Time) ([]agent.Observation, error) {
+	anchorText := formatObservationTime(anchor)
+	rows, err := tx.Query(`
+WITH recent_agents AS (
+    SELECT DISTINCT agent_id
+    FROM observations
+    WHERE endpoint_host = ?
+      AND COALESCE(endpoint_port, '') = ?
+      AND endpoint_tls = ?
+      AND observed_at >= ?
+),
+baseline_ranked AS (
+    SELECT payload_json, observed_at, id,
+           ROW_NUMBER() OVER (
+               PARTITION BY agent_id
+               ORDER BY observed_at DESC, id DESC
+           ) AS row_number
+    FROM observations
+    WHERE endpoint_host = ?
+      AND COALESCE(endpoint_port, '') = ?
+      AND endpoint_tls = ?
+      AND observed_at < ?
+      AND agent_id IN (SELECT agent_id FROM recent_agents)
+),
+replay AS (
+    SELECT payload_json, observed_at, id
+    FROM baseline_ranked
+    WHERE row_number = 1
+    UNION ALL
+    SELECT payload_json, observed_at, id
+    FROM observations
+    WHERE endpoint_host = ?
+      AND COALESCE(endpoint_port, '') = ?
+      AND endpoint_tls = ?
+      AND observed_at >= ?
+)
+SELECT payload_json
+FROM replay
+ORDER BY observed_at DESC, id DESC`,
+		host, port, tls, anchorText,
+		host, port, tls, anchorText,
+		host, port, tls, anchorText,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return decodeObservationRowsTx(rows)
 }
 
 func recentObservationsTx(tx *sql.Tx, limit int) ([]agent.Observation, error) {
