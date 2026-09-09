@@ -13,6 +13,8 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+const observationTimeLayout = "2006-01-02T15:04:05.000000000Z"
+
 type SQLiteStore struct {
 	db *sql.DB
 }
@@ -30,6 +32,10 @@ func OpenSQLiteStore(path string) (*SQLiteStore, error) {
 	}
 	store := &SQLiteStore{db: db}
 	if err := store.migrate(); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if err := store.normalizeLegacyTimes(); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
@@ -67,6 +73,88 @@ CREATE INDEX IF NOT EXISTS idx_incident_records_status
     ON incident_records(status, started_at DESC);
 `)
 	return err
+}
+
+func (s *SQLiteStore) normalizeLegacyTimes() error {
+	if s == nil || s.db == nil {
+		return errors.New("sqlite store is not open")
+	}
+
+	type timestampUpdate struct {
+		id    int64
+		value string
+	}
+
+	observationRows, err := s.db.Query(`SELECT id, payload_json FROM observations`)
+	if err != nil {
+		return err
+	}
+	observationUpdates := make([]timestampUpdate, 0)
+	for observationRows.Next() {
+		var id int64
+		var payload []byte
+		if err := observationRows.Scan(&id, &payload); err != nil {
+			_ = observationRows.Close()
+			return err
+		}
+		var observation agent.Observation
+		if err := json.Unmarshal(payload, &observation); err != nil {
+			_ = observationRows.Close()
+			return err
+		}
+		observationUpdates = append(observationUpdates, timestampUpdate{id: id, value: formatObservationTime(observation.ObservedAt)})
+	}
+	if err := observationRows.Err(); err != nil {
+		_ = observationRows.Close()
+		return err
+	}
+	if err := observationRows.Close(); err != nil {
+		return err
+	}
+
+	incidentRows, err := s.db.Query(`SELECT id, payload_json FROM incident_records`)
+	if err != nil {
+		return err
+	}
+	incidentUpdates := make([]timestampUpdate, 0)
+	for incidentRows.Next() {
+		var id int64
+		var payload []byte
+		if err := incidentRows.Scan(&id, &payload); err != nil {
+			_ = incidentRows.Close()
+			return err
+		}
+		var incident IncidentLifecycle
+		if err := json.Unmarshal(payload, &incident); err != nil {
+			_ = incidentRows.Close()
+			return err
+		}
+		incidentUpdates = append(incidentUpdates, timestampUpdate{id: id, value: formatObservationTime(incident.StartedAt)})
+	}
+	if err := incidentRows.Err(); err != nil {
+		_ = incidentRows.Close()
+		return err
+	}
+	if err := incidentRows.Close(); err != nil {
+		return err
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, update := range observationUpdates {
+		if _, err := tx.Exec(`UPDATE observations SET observed_at = ? WHERE id = ?`, update.value, update.id); err != nil {
+			return err
+		}
+	}
+	for _, update := range incidentUpdates {
+		if _, err := tx.Exec(`UPDATE incident_records SET started_at = ? WHERE id = ?`, update.value, update.id); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 func (s *SQLiteStore) Store(observation agent.Observation) error {
@@ -200,7 +288,7 @@ func decodeObservationRows(rows *sql.Rows) ([]agent.Observation, error) {
 }
 
 func formatObservationTime(value time.Time) string {
-	return value.UTC().Format(time.RFC3339Nano)
+	return value.UTC().Format(observationTimeLayout)
 }
 
 func (s *SQLiteStore) Count() (int, error) {
