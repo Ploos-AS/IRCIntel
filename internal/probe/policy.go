@@ -40,19 +40,23 @@ func NewRunner(identity Identity, policy Policy) (*Runner, error) {
 
 func (r *Runner) authorize(host string) error {
 	for _, denied := range r.policy.DenyHosts {
-		if hostMatch(host, denied) { return fmt.Errorf("target %q is denied", host) }
+		if hostMatch(host, denied) {
+			return probeError(CodeTargetDenied, "policy", fmt.Errorf("target %q is denied", host))
+		}
 	}
 	allowed := false
 	for _, candidate := range r.policy.AllowHosts {
 		if hostMatch(host, candidate) { allowed = true; break }
 	}
-	if !allowed { return fmt.Errorf("target %q is not allowlisted", host) }
+	if !allowed {
+		return probeError(CodeTargetNotAllowed, "policy", fmt.Errorf("target %q is not allowlisted", host))
+	}
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	now := r.now()
 	if previous, ok := r.last[host]; ok && now.Sub(previous) < r.policy.MinInterval {
-		return fmt.Errorf("target %q is rate limited", host)
+		return probeError(CodeRateLimited, "policy", fmt.Errorf("target %q is rate limited", host))
 	}
 	r.last[host] = now
 	return nil
