@@ -8,6 +8,11 @@ import (
 	"strings"
 )
 
+var (
+	ErrRegistryNetworkNotFound = errors.New("registry network does not exist")
+	ErrRegistryServerNotFound  = errors.New("registry server does not exist")
+)
+
 type Network struct {
 	ID          string `json:"id"`
 	Name        string `json:"name"`
@@ -97,7 +102,7 @@ func (s *SQLiteStore) UpsertNetworkServer(server NetworkServer) error {
 		return err
 	}
 	if exists == 0 {
-		return errors.New("network does not exist")
+		return ErrRegistryNetworkNotFound
 	}
 	_, err := s.db.Exec(`
 INSERT INTO network_servers (id, network_id, name)
@@ -124,7 +129,7 @@ func (s *SQLiteStore) UpsertNetworkEndpoint(endpoint NetworkEndpoint) error {
 		return err
 	}
 	if exists == 0 {
-		return errors.New("server does not exist")
+		return ErrRegistryServerNotFound
 	}
 	_, err := s.db.Exec(`
 INSERT INTO network_endpoints (id, server_id, host, port, tls)
