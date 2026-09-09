@@ -1,7 +1,6 @@
 package core
 
 import (
-	"database/sql"
 	"path/filepath"
 	"testing"
 	"time"
@@ -138,5 +137,3 @@ func TestSQLiteStoreAtomicIngestStillCommitsSuccessfulObservation(t *testing.T) 
 		t.Fatalf("observation count=%d want=1", count)
 	}
 }
-
-var _ = sql.ErrNoRows
