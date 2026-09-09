@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/Ploos-AS/IRCIntel/internal/agent"
 	_ "modernc.org/sqlite"
@@ -137,7 +138,9 @@ func (s *SQLiteStore) List(query ObservationQuery) ([]agent.Observation, error) 
 	return observations, nil
 }
 
-func formatObservationTime(value interface{ UTC() /* placeholder */ }) string { return "" }
+func formatObservationTime(value time.Time) string {
+	return value.UTC().Format(time.RFC3339Nano)
+}
 
 func (s *SQLiteStore) Count() (int, error) {
 	if s == nil || s.db == nil {
