@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -12,6 +13,8 @@ import (
 
 var version = "dev"
 
+const defaultStatusFreshness = 15 * time.Minute
+
 type versionResponse struct {
 	Name    string `json:"name"`
 	Version string `json:"version"`
@@ -20,14 +23,16 @@ type versionResponse struct {
 func main() {
 	listen := getenv("IRCINTEL_LISTEN", ":8080")
 	dbPath := getenv("IRCINTEL_DB_PATH", "/data/ircintel.db")
+	statusFreshness, err := getenvDuration("IRCINTEL_STATUS_FRESHNESS", defaultStatusFreshness)
+	if err != nil { log.Fatalf("configure status freshness: %v", err) }
 	store, err := core.OpenSQLiteStore(dbPath)
 	if err != nil { log.Fatalf("open observation store: %v", err) }
 	defer store.Close()
 	token := os.Getenv("IRCINTEL_CORE_TOKEN")
 	ingest := core.IngestHandler{Token: token, Store: store}
 	read := core.ReadHandler{Token: token, Reader: store}
-	status := core.StatusHandler{Token: token, Reader: store}
-	networkStatus := core.NetworkStatusHandler{Token: token, Reader: store}
+	status := core.StatusHandler{Token: token, Reader: store, Freshness: statusFreshness}
+	networkStatus := core.NetworkStatusHandler{Token: token, Reader: store, Freshness: statusFreshness}
 	networkIncidents := core.NetworkIncidentHandler{Token: token, Reader: store}
 	networkIncidentStats := core.NetworkIncidentStatsHandler{Token: token, Reader: store}
 	networkIncidentStatsByNetwork := core.NetworkIncidentStatsByNetworkHandler{Token: token, Reader: store}
@@ -74,3 +79,12 @@ func main() {
 }
 
 func getenv(key, fallback string) string { if value := os.Getenv(key); value != "" { return value }; return fallback }
+
+func getenvDuration(key string, fallback time.Duration) (time.Duration, error) {
+	raw := os.Getenv(key)
+	if raw == "" { return fallback, nil }
+	value, err := time.ParseDuration(raw)
+	if err != nil { return 0, fmt.Errorf("%s must be a Go duration: %w", key, err) }
+	if value <= 0 { return 0, fmt.Errorf("%s must be greater than zero", key) }
+	return value, nil
+}
