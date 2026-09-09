@@ -39,6 +39,20 @@ func NewRunner(identity Identity, policy Policy) (*Runner, error) {
 }
 
 func (r *Runner) authorize(host string) error {
+	return r.authorizeKey(host, strings.ToLower(strings.TrimSpace(host)))
+}
+
+func (r *Runner) authorizeEndpoint(host, port string, tls bool) error {
+	hostKey := strings.ToLower(strings.TrimSpace(host))
+	port = strings.TrimSpace(port)
+	if port == "" {
+		if tls { port = "6697" } else { port = "6667" }
+	}
+	key := fmt.Sprintf("%s|%s|%t", hostKey, port, tls)
+	return r.authorizeKey(host, key)
+}
+
+func (r *Runner) authorizeKey(host, rateKey string) error {
 	for _, denied := range r.policy.DenyHosts {
 		if hostMatch(host, denied) {
 			return probeError(CodeTargetDenied, "policy", fmt.Errorf("target %q is denied", host))
@@ -55,10 +69,10 @@ func (r *Runner) authorize(host string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	now := r.now()
-	if previous, ok := r.last[host]; ok && now.Sub(previous) < r.policy.MinInterval {
+	if previous, ok := r.last[rateKey]; ok && now.Sub(previous) < r.policy.MinInterval {
 		return probeError(CodeRateLimited, "policy", fmt.Errorf("target %q is rate limited", host))
 	}
-	r.last[host] = now
+	r.last[rateKey] = now
 	return nil
 }
 
