@@ -127,27 +127,9 @@ func (h DiscoveryPromotionHandler) authorize(w http.ResponseWriter, r *http.Requ
 	return true
 }
 
-func (s *SQLiteStore) ensureDiscoveryPromotionSchema() error {
-	if s == nil || s.db == nil {
-		return errors.New("sqlite store is not open")
-	}
-	_, err := s.db.Exec(`
-CREATE TABLE IF NOT EXISTS discovery_promotions (
-    candidate_id TEXT PRIMARY KEY,
-    endpoint_id TEXT NOT NULL,
-    server_id TEXT NOT NULL,
-    promoter TEXT NOT NULL,
-    note TEXT NOT NULL DEFAULT '',
-    promoted_at TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_discovery_promotions_time
-    ON discovery_promotions(promoted_at DESC);`)
-	return err
-}
-
 func (s *SQLiteStore) PromoteDiscoveryCandidate(input DiscoveryPromotionInput, promotedAt time.Time) (DiscoveryPromotion, error) {
-	if err := s.ensureDiscoveryPromotionSchema(); err != nil {
-		return DiscoveryPromotion{}, err
+	if s == nil || s.db == nil {
+		return DiscoveryPromotion{}, errors.New("sqlite store is not open")
 	}
 	input.CandidateID = strings.TrimSpace(input.CandidateID)
 	input.EndpointID = strings.TrimSpace(input.EndpointID)
@@ -210,8 +192,8 @@ VALUES (?, ?, ?, ?, ?, ?)`, input.CandidateID, input.EndpointID, input.ServerID,
 }
 
 func (s *SQLiteStore) ListDiscoveryPromotions() ([]DiscoveryPromotion, error) {
-	if err := s.ensureDiscoveryPromotionSchema(); err != nil {
-		return nil, err
+	if s == nil || s.db == nil {
+		return nil, errors.New("sqlite store is not open")
 	}
 	rows, err := s.db.Query(`SELECT candidate_id, endpoint_id, server_id, promoter, note, promoted_at FROM discovery_promotions ORDER BY promoted_at DESC, candidate_id`)
 	if err != nil {
