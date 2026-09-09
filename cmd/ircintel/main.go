@@ -25,7 +25,9 @@ func main() {
 		log.Fatalf("open observation store: %v", err)
 	}
 	defer store.Close()
-	ingest := core.IngestHandler{Token: os.Getenv("IRCINTEL_CORE_TOKEN"), Store: store}
+	token := os.Getenv("IRCINTEL_CORE_TOKEN")
+	ingest := core.IngestHandler{Token: token, Store: store}
+	read := core.ReadHandler{Token: token, Reader: store}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
@@ -37,6 +39,7 @@ func main() {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(versionResponse{Name: "IRCIntel", Version: version})
 	})
+	mux.Handle("GET /api/v1/observations", read)
 	mux.Handle("POST /api/v1/observations", ingest)
 
 	srv := &http.Server{
