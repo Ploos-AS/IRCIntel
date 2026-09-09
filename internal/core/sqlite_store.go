@@ -46,7 +46,8 @@ func (s *SQLiteStore) migrate() error {
 	// before explicit schema versioning. CREATE IF NOT EXISTS is intentionally
 	// retained so the same migration safely upgrades legacy installations.
 	if version == 0 {
-		if _, err := s.db.Exec(`
+		if err := s.runMigration(1, func(tx *sql.Tx) error {
+			if _, err := tx.Exec(`
 CREATE TABLE IF NOT EXISTS observations (id INTEGER PRIMARY KEY AUTOINCREMENT, agent_id TEXT NOT NULL, observed_at TEXT NOT NULL, endpoint_host TEXT NOT NULL, endpoint_port TEXT, endpoint_tls INTEGER NOT NULL, payload_json BLOB NOT NULL);
 CREATE INDEX IF NOT EXISTS idx_observations_agent_time ON observations(agent_id, observed_at);
 CREATE INDEX IF NOT EXISTS idx_observations_endpoint_time ON observations(endpoint_host, endpoint_port, observed_at);
@@ -63,10 +64,11 @@ CREATE INDEX IF NOT EXISTS idx_network_servers_network ON network_servers(networ
 CREATE TABLE IF NOT EXISTS network_endpoints (id TEXT PRIMARY KEY, server_id TEXT NOT NULL, host TEXT NOT NULL, port TEXT NOT NULL, tls INTEGER NOT NULL, FOREIGN KEY(server_id) REFERENCES network_servers(id), UNIQUE(server_id, host, port, tls));
 CREATE INDEX IF NOT EXISTS idx_network_endpoints_server ON network_endpoints(server_id, host, port);`); err != nil { return err }
 
-		// M2.12 historically normalized these columns on every process start. It is
-		// now a one-time v0 -> v1 data migration, eliminating an O(N) startup scan.
-		if err := s.normalizeLegacyTimes(); err != nil { return err }
-		if _, err := s.db.Exec(`PRAGMA user_version = 1`); err != nil { return err }
+			// M2.12 historically normalized these columns on every process start. It is
+			// now a one-time v0 -> v1 data migration, inside the same transaction as
+			// the schema creation and version bump.
+			return normalizeLegacyTimesTx(tx)
+		}); err != nil { return err }
 		version = 1
 	}
 
@@ -74,7 +76,8 @@ CREATE INDEX IF NOT EXISTS idx_network_endpoints_server ON network_endpoints(ser
 	// migration chain. Older deployments created these tables lazily on first use;
 	// IF NOT EXISTS preserves those installations without rewriting their data.
 	if version == 1 {
-		if _, err := s.db.Exec(`
+		if err := s.runMigration(2, func(tx *sql.Tx) error {
+			_, err := tx.Exec(`
 CREATE TABLE IF NOT EXISTS discovery_candidates (
     id TEXT PRIMARY KEY,
     host TEXT NOT NULL,
@@ -106,18 +109,17 @@ CREATE TABLE IF NOT EXISTS discovery_promotions (
     note TEXT NOT NULL DEFAULT '',
     promoted_at TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_discovery_promotions_time ON discovery_promotions(promoted_at DESC);`); err != nil { return err }
-		if _, err := s.db.Exec(`PRAGMA user_version = 2`); err != nil { return err }
+CREATE INDEX IF NOT EXISTS idx_discovery_promotions_time ON discovery_promotions(promoted_at DESC);`)
+			return err
+		}); err != nil { return err }
 		version = 2
 	}
 
 	// M3.20 makes agent retries idempotent. Before adding the unique observation
 	// identity index, collapse any historical duplicates and keep the newest row.
 	if version == 2 {
-		tx, err := s.db.Begin()
-		if err != nil { return err }
-		defer tx.Rollback()
-		if _, err := tx.Exec(`
+		if err := s.runMigration(3, func(tx *sql.Tx) error {
+			_, err := tx.Exec(`
 DELETE FROM observations
 WHERE id NOT IN (
     SELECT MAX(id)
@@ -125,27 +127,45 @@ WHERE id NOT IN (
     GROUP BY agent_id, observed_at, endpoint_host, COALESCE(endpoint_port, ''), endpoint_tls
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_observations_identity
-    ON observations(agent_id, observed_at, endpoint_host, COALESCE(endpoint_port, ''), endpoint_tls);`); err != nil { return err }
-		if _, err := tx.Exec(`PRAGMA user_version = 3`); err != nil { return err }
-		if err := tx.Commit(); err != nil { return err }
+    ON observations(agent_id, observed_at, endpoint_host, COALESCE(endpoint_port, ''), endpoint_tls);`)
+			return err
+		}); err != nil { return err }
 	}
 	return nil
 }
 
+func (s *SQLiteStore) runMigration(targetVersion int, apply func(*sql.Tx) error) error {
+	if s == nil || s.db == nil { return errors.New("sqlite store is not open") }
+	tx, err := s.db.Begin()
+	if err != nil { return err }
+	defer tx.Rollback()
+	if err := apply(tx); err != nil { return err }
+	if _, err := tx.Exec(fmt.Sprintf("PRAGMA user_version = %d", targetVersion)); err != nil { return err }
+	return tx.Commit()
+}
+
 func (s *SQLiteStore) normalizeLegacyTimes() error {
 	if s == nil || s.db == nil { return errors.New("sqlite store is not open") }
+	tx, err := s.db.Begin()
+	if err != nil { return err }
+	defer tx.Rollback()
+	if err := normalizeLegacyTimesTx(tx); err != nil { return err }
+	return tx.Commit()
+}
+
+func normalizeLegacyTimesTx(tx *sql.Tx) error {
+	if tx == nil { return errors.New("sqlite transaction is required") }
 	type timestampUpdate struct { id int64; value string }
-	observationRows, err := s.db.Query(`SELECT id, payload_json FROM observations`); if err != nil{return err}
+	observationRows, err := tx.Query(`SELECT id, payload_json FROM observations`); if err != nil{return err}
 	observationUpdates:=make([]timestampUpdate,0)
 	for observationRows.Next(){var id int64;var payload []byte;if err:=observationRows.Scan(&id,&payload);err!=nil{_ = observationRows.Close();return err};var observation agent.Observation;if err:=json.Unmarshal(payload,&observation);err!=nil{_ = observationRows.Close();return err};observationUpdates=append(observationUpdates,timestampUpdate{id,formatObservationTime(observation.ObservedAt)})}
 	if err:=observationRows.Err();err!=nil{_ = observationRows.Close();return err};if err:=observationRows.Close();err!=nil{return err}
-	incidentRows,err:=s.db.Query(`SELECT id, payload_json FROM incident_records`);if err!=nil{return err};incidentUpdates:=make([]timestampUpdate,0)
+	incidentRows,err:=tx.Query(`SELECT id, payload_json FROM incident_records`);if err!=nil{return err};incidentUpdates:=make([]timestampUpdate,0)
 	for incidentRows.Next(){var id int64;var payload []byte;if err:=incidentRows.Scan(&id,&payload);err!=nil{_ = incidentRows.Close();return err};var incident IncidentLifecycle;if err:=json.Unmarshal(payload,&incident);err!=nil{_ = incidentRows.Close();return err};incidentUpdates=append(incidentUpdates,timestampUpdate{id,formatObservationTime(incident.StartedAt)})}
 	if err:=incidentRows.Err();err!=nil{_ = incidentRows.Close();return err};if err:=incidentRows.Close();err!=nil{return err}
-	tx,err:=s.db.Begin();if err!=nil{return err};defer tx.Rollback()
 	for _,u:=range observationUpdates{if _,err:=tx.Exec(`UPDATE observations SET observed_at = ? WHERE id = ?`,u.value,u.id);err!=nil{return err}}
 	for _,u:=range incidentUpdates{if _,err:=tx.Exec(`UPDATE incident_records SET started_at = ? WHERE id = ?`,u.value,u.id);err!=nil{return err}}
-	return tx.Commit()
+	return nil
 }
 
 func (s *SQLiteStore) Store(observation agent.Observation) error {
