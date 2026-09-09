@@ -162,8 +162,10 @@ func TestNewRunnerRequiresIdentityAndAllowlist(t *testing.T) {
 
 func TestPolicyDenyAndDefaultDeny(t *testing.T) {
 	r := testRunner(t, time.Minute)
-	if _, err := r.Run(context.Background(), Config{Host: "example.org"}); err == nil { t.Fatal("expected non-allowlisted target rejection") }
-	if _, err := r.Run(context.Background(), Config{Host: "blocked.localhost"}); err == nil { t.Fatal("expected denylist rejection") }
+	_, err := r.Run(context.Background(), Config{Host: "example.org"})
+	if code, stage := ErrorInfo(err); code != CodeTargetNotAllowed || stage != "policy" { t.Fatalf("not allowed: code=%q stage=%q err=%v", code, stage, err) }
+	_, err = r.Run(context.Background(), Config{Host: "blocked.localhost"})
+	if code, stage := ErrorInfo(err); code != CodeTargetDenied || stage != "policy" { t.Fatalf("denied: code=%q stage=%q err=%v", code, stage, err) }
 }
 
 func TestRateLimit(t *testing.T) {
@@ -171,7 +173,8 @@ func TestRateLimit(t *testing.T) {
 	now := time.Unix(1000, 0)
 	r.now = func() time.Time { return now }
 	if err := r.authorize("localhost"); err != nil { t.Fatal(err) }
-	if err := r.authorize("localhost"); err == nil { t.Fatal("expected rate limit") }
+	err := r.authorize("localhost")
+	if code, stage := ErrorInfo(err); code != CodeRateLimited || stage != "policy" { t.Fatalf("rate limit: code=%q stage=%q err=%v", code, stage, err) }
 	now = now.Add(time.Hour)
 	if err := r.authorize("localhost"); err != nil { t.Fatal(err) }
 }
