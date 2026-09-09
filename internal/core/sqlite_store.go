@@ -67,7 +67,7 @@ INSERT INTO observations (
     agent_id, observed_at, endpoint_host, endpoint_port, endpoint_tls, payload_json
 ) VALUES (?, ?, ?, ?, ?, ?)`,
 		observation.AgentID,
-		observation.ObservedAt.UTC().Format("2006-01-02T15:04:05.999999999Z07:00"),
+		formatObservationTime(observation.ObservedAt),
 		observation.Endpoint.Host,
 		observation.Endpoint.Port,
 		observation.Endpoint.TLS,
@@ -83,9 +83,12 @@ func (s *SQLiteStore) List(query ObservationQuery) ([]agent.Observation, error) 
 	if query.Limit < 1 || query.Limit > maxObservationLimit {
 		return nil, errors.New("invalid observation limit")
 	}
+	if !query.Since.IsZero() && !query.Until.IsZero() && query.Since.After(query.Until) {
+		return nil, errors.New("invalid observation time range")
+	}
 
-	where := make([]string, 0, 2)
-	args := make([]any, 0, 3)
+	where := make([]string, 0, 4)
+	args := make([]any, 0, 5)
 	if query.AgentID != "" {
 		where = append(where, "agent_id = ?")
 		args = append(args, query.AgentID)
@@ -93,6 +96,14 @@ func (s *SQLiteStore) List(query ObservationQuery) ([]agent.Observation, error) 
 	if query.Host != "" {
 		where = append(where, "endpoint_host = ?")
 		args = append(args, query.Host)
+	}
+	if !query.Since.IsZero() {
+		where = append(where, "observed_at >= ?")
+		args = append(args, formatObservationTime(query.Since))
+	}
+	if !query.Until.IsZero() {
+		where = append(where, "observed_at <= ?")
+		args = append(args, formatObservationTime(query.Until))
 	}
 
 	statement := "SELECT payload_json FROM observations"
@@ -125,6 +136,8 @@ func (s *SQLiteStore) List(query ObservationQuery) ([]agent.Observation, error) 
 	}
 	return observations, nil
 }
+
+func formatObservationTime(value interface{ UTC() /* placeholder */ }) string { return "" }
 
 func (s *SQLiteStore) Count() (int, error) {
 	if s == nil || s.db == nil {
