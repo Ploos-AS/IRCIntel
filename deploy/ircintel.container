@@ -1,0 +1,16 @@
+[Unit]
+Description=IRCIntel
+After=network-online.target
+Wants=network-online.target
+
+[Container]
+Image=ghcr.io/ploos-as/ircintel:latest
+ContainerName=ircintel
+PublishPort=8080:8080
+Environment=IRCINTEL_LISTEN=:8080
+
+[Service]
+Restart=always
+
+[Install]
+WantedBy=default.target

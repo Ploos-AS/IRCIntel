@@ -1,0 +1,10 @@
+services:
+  ircintel:
+    build:
+      context: .
+    image: ghcr.io/ploos-as/ircintel:latest
+    environment:
+      IRCINTEL_LISTEN: ":8080"
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
