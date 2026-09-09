@@ -36,9 +36,10 @@ func TestRunCapturesServerMetadata(t *testing.T) {
 		if err := readUntil(r, "USER ircintel 0 * :IRCIntel test probe | contact: https://example.invalid/ircintel"); err != nil { return err }
 		if _, err := fmt.Fprint(conn, ":irc.example CAP IRCIntelProbe LS :multi-prefix sasl\r\n"); err != nil { return err }
 		if err := readUntil(r, "CAP END"); err != nil { return err }
+		if _, err := fmt.Fprint(conn, ":irc.example 001 IRCIntelProbe :welcome\r\n"); err != nil { return err }
 		if _, err := fmt.Fprint(conn, ":irc.example 004 IRCIntelProbe irc.example ircd-2.0 io k beI\r\n"); err != nil { return err }
 		if _, err := fmt.Fprint(conn, ":irc.example 005 IRCIntelProbe NETWORK=ExampleNet CHANTYPES=#& PREFIX=(ov)@+ :are supported\r\n"); err != nil { return err }
-		_, err := fmt.Fprint(conn, ":irc.example 001 IRCIntelProbe :welcome\r\n")
+		_, err := fmt.Fprint(conn, ":irc.example 376 IRCIntelProbe :End of MOTD\r\n")
 		return err
 	})
 
@@ -50,5 +51,22 @@ func TestRunCapturesServerMetadata(t *testing.T) {
 		t.Fatalf("software=%q version=%q", result.ServerMetadata.Software, result.ServerMetadata.SoftwareVersion)
 	}
 	if result.ServerMetadata.ISupport["CHANTYPES"] != "#&" { t.Fatalf("isupport=%v", result.ServerMetadata.ISupport) }
+	if err := <-done; err != nil { t.Fatal(err) }
+}
+
+func TestRunCompletesOnNoMOTD(t *testing.T) {
+	port, done := serveOnce(t, "tcp4", "127.0.0.1:0", func(conn net.Conn) error {
+		r := bufio.NewReader(conn)
+		if err := readUntil(r, "USER ircintel 0 * :IRCIntel test probe | contact: https://example.invalid/ircintel"); err != nil { return err }
+		if _, err := fmt.Fprint(conn, ":irc.example CAP IRCIntelProbe LS :server-time\r\n"); err != nil { return err }
+		if err := readUntil(r, "CAP END"); err != nil { return err }
+		if _, err := fmt.Fprint(conn, ":irc.example 001 IRCIntelProbe :welcome\r\n"); err != nil { return err }
+		_, err := fmt.Fprint(conn, ":irc.example 422 IRCIntelProbe :MOTD File is missing\r\n")
+		return err
+	})
+
+	result, err := testRunner(t, time.Millisecond).Run(context.Background(), Config{Host: "localhost", Port: port, Family: "ipv4", Timeout: 2 * time.Second})
+	if err != nil { t.Fatal(err) }
+	if result.RegistrationMS < 0 { t.Fatalf("registration latency=%d", result.RegistrationMS) }
 	if err := <-done; err != nil { t.Fatal(err) }
 }
