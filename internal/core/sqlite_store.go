@@ -51,6 +51,20 @@ CREATE INDEX IF NOT EXISTS idx_observations_agent_time
     ON observations(agent_id, observed_at);
 CREATE INDEX IF NOT EXISTS idx_observations_endpoint_time
     ON observations(endpoint_host, endpoint_port, observed_at);
+CREATE TABLE IF NOT EXISTS incident_records (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    endpoint_host TEXT NOT NULL,
+    endpoint_port TEXT,
+    endpoint_tls INTEGER NOT NULL,
+    started_at TEXT NOT NULL,
+    status TEXT NOT NULL,
+    payload_json BLOB NOT NULL,
+    UNIQUE(endpoint_host, endpoint_port, endpoint_tls, started_at)
+);
+CREATE INDEX IF NOT EXISTS idx_incident_records_started
+    ON incident_records(started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_incident_records_status
+    ON incident_records(status, started_at DESC);
 `)
 	return err
 }
@@ -74,7 +88,10 @@ INSERT INTO observations (
 		observation.Endpoint.TLS,
 		payload,
 	)
-	return err
+	if err != nil {
+		return err
+	}
+	return s.refreshIncidentRecords()
 }
 
 func (s *SQLiteStore) List(query ObservationQuery) ([]agent.Observation, error) {
