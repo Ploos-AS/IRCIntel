@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/Ploos-AS/IRCIntel/internal/agent"
 	_ "modernc.org/sqlite"
@@ -73,6 +74,56 @@ INSERT INTO observations (
 		payload,
 	)
 	return err
+}
+
+func (s *SQLiteStore) List(query ObservationQuery) ([]agent.Observation, error) {
+	if s == nil || s.db == nil {
+		return nil, errors.New("sqlite store is not open")
+	}
+	if query.Limit < 1 || query.Limit > maxObservationLimit {
+		return nil, errors.New("invalid observation limit")
+	}
+
+	where := make([]string, 0, 2)
+	args := make([]any, 0, 3)
+	if query.AgentID != "" {
+		where = append(where, "agent_id = ?")
+		args = append(args, query.AgentID)
+	}
+	if query.Host != "" {
+		where = append(where, "endpoint_host = ?")
+		args = append(args, query.Host)
+	}
+
+	statement := "SELECT payload_json FROM observations"
+	if len(where) > 0 {
+		statement += " WHERE " + strings.Join(where, " AND ")
+	}
+	statement += " ORDER BY observed_at DESC, id DESC LIMIT ?"
+	args = append(args, query.Limit)
+
+	rows, err := s.db.Query(statement, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	observations := make([]agent.Observation, 0)
+	for rows.Next() {
+		var payload []byte
+		if err := rows.Scan(&payload); err != nil {
+			return nil, err
+		}
+		var observation agent.Observation
+		if err := json.Unmarshal(payload, &observation); err != nil {
+			return nil, err
+		}
+		observations = append(observations, observation)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return observations, nil
 }
 
 func (s *SQLiteStore) Count() (int, error) {
