@@ -30,7 +30,7 @@ VALUES (?, ?, ?, ?, ?, ?)`,
 	if count != 2 { t.Fatalf("count=%d want=2", count) }
 }
 
-func TestEndpointIncidentRefreshRejectsCorruptPayloadOnAffectedEndpoint(t *testing.T) {
+func TestEventDrivenIncidentRefreshIgnoresHistoricalCorruptObservationOnAffectedEndpoint(t *testing.T) {
 	store, err := OpenSQLiteStore(filepath.Join(t.TempDir(), "ircintel.db"))
 	if err != nil { t.Fatal(err) }
 	defer store.Close()
@@ -45,12 +45,12 @@ VALUES (?, ?, ?, ?, ?, ?)`,
 		t.Fatal(err)
 	}
 
-	if err := store.Store(observation); err == nil {
-		t.Fatal("expected affected endpoint refresh to reject corrupt payload")
+	if err := store.Store(observation); err != nil {
+		t.Fatalf("historical raw observation should not be replayed by normal ingest: %v", err)
 	}
 	count, err := store.Count()
 	if err != nil { t.Fatal(err) }
-	if count != 1 { t.Fatalf("count=%d want=1 after rollback", count) }
+	if count != 2 { t.Fatalf("count=%d want=2", count) }
 }
 
 func TestObservationsForLatestEndpointTxReturnsOnlyAffectedEndpoint(t *testing.T) {
