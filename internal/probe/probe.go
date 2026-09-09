@@ -81,16 +81,31 @@ func (r *Runner) Run(ctx context.Context, cfg Config) (Result, error) {
 	}
 
 	scanner := bufio.NewScanner(conn)
+	scanner.Buffer(make([]byte, 4096), 256*1024)
 	caps := map[string]struct{}{}
+	capEnded := false
 	for scanner.Scan() {
 		line := scanner.Text()
 		parts := strings.Fields(line)
 		if len(parts) > 0 && strings.HasPrefix(parts[0], ":") && result.Server == "" { result.Server = strings.TrimPrefix(parts[0], ":") }
-		if strings.Contains(line, " CAP ") && strings.Contains(line, " LS ") {
+
+		if strings.HasPrefix(line, "PING ") {
+			payload := strings.TrimSpace(strings.TrimPrefix(line, "PING"))
+			if payload == "" { payload = ":" }
+			if _, err := fmt.Fprintf(conn, "PONG %s\r\n", payload); err != nil { return result, fmt.Errorf("irc pong write: %w", err) }
+			continue
+		}
+
+		if isCAPLS(parts) {
 			if idx := strings.Index(line, " :"); idx >= 0 {
 				for _, capability := range strings.Fields(line[idx+2:]) { caps[capability] = struct{}{} }
 			}
+			if !capLSContinues(parts) && !capEnded {
+				if _, err := fmt.Fprint(conn, "CAP END\r\n"); err != nil { return result, fmt.Errorf("irc cap end write: %w", err) }
+				capEnded = true
+			}
 		}
+
 		if len(parts) >= 2 && parts[1] == "001" {
 			result.RegistrationMS = time.Since(registrationStart).Milliseconds()
 			_, _ = fmt.Fprint(conn, "QUIT :IRCIntel probe complete\r\n")
@@ -101,4 +116,20 @@ func (r *Runner) Run(ctx context.Context, cfg Config) (Result, error) {
 	}
 	if err := scanner.Err(); err != nil { return result, fmt.Errorf("irc read: %w", err) }
 	return result, errors.New("connection closed before IRC registration completed")
+}
+
+func isCAPLS(parts []string) bool {
+	for i := 0; i+1 < len(parts); i++ {
+		if strings.EqualFold(parts[i], "CAP") && strings.EqualFold(parts[i+1], "LS") { return true }
+	}
+	return false
+}
+
+func capLSContinues(parts []string) bool {
+	for i := 0; i+2 < len(parts); i++ {
+		if strings.EqualFold(parts[i], "CAP") && strings.EqualFold(parts[i+1], "LS") {
+			return parts[i+2] == "*"
+		}
+	}
+	return false
 }
