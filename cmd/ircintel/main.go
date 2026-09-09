@@ -28,6 +28,7 @@ func main() {
 	token := os.Getenv("IRCINTEL_CORE_TOKEN")
 	ingest := core.IngestHandler{Token: token, Store: store}
 	read := core.ReadHandler{Token: token, Reader: store}
+	status := core.StatusHandler{Token: token, Reader: store}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
@@ -41,6 +42,7 @@ func main() {
 	})
 	mux.Handle("GET /api/v1/observations", read)
 	mux.Handle("POST /api/v1/observations", ingest)
+	mux.Handle("GET /api/v1/endpoints/status", status)
 
 	srv := &http.Server{
 		Addr:              listen,
