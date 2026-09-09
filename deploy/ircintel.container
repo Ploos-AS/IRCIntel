@@ -8,6 +8,8 @@ Image=ghcr.io/ploos-as/ircintel:latest
 ContainerName=ircintel
 PublishPort=8080:8080
 Environment=IRCINTEL_LISTEN=:8080
+Environment=IRCINTEL_DB_PATH=/data/ircintel.db
+Volume=ircintel-data.volume:/data
 
 [Service]
 Restart=always
