@@ -39,5 +39,5 @@ func TestSQLiteStoreV3ToV4NormalizesNetworkIncidentTimes(t *testing.T) {
 
 	var version int
 	if err := reopened.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil { t.Fatal(err) }
-	if version != 4 { t.Fatalf("user_version=%d want=4", version) }
+	if version != sqliteSchemaVersion { t.Fatalf("user_version=%d want=%d", version, sqliteSchemaVersion) }
 }
