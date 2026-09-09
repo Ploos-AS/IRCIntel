@@ -116,6 +116,7 @@ func (r *Runner) Run(ctx context.Context, cfg Config) (Result, error) {
 	scanner.Buffer(make([]byte, 4096), 256*1024)
 	caps := map[string]struct{}{}
 	capEnded := false
+	registered := false
 	serverMetadata := ServerMetadata{}
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -141,19 +142,35 @@ func (r *Runner) Run(ctx context.Context, cfg Config) (Result, error) {
 			}
 		}
 
-		if len(parts) >= 2 && parts[1] == "001" {
+		if len(parts) >= 2 && parts[1] == "001" && !registered {
+			registered = true
 			result.RegistrationMS = time.Since(registrationStart).Milliseconds()
-			_, _ = fmt.Fprint(conn, "QUIT :IRCIntel probe complete\r\n")
-			for capability := range caps { result.Capabilities = append(result.Capabilities, capability) }
-			sort.Strings(result.Capabilities)
-			if serverMetadata.Network != "" || serverMetadata.Software != "" || serverMetadata.SoftwareVersion != "" || len(serverMetadata.ISupport) > 0 {
-				result.ServerMetadata = &serverMetadata
-			}
+			grace := time.Now().Add(750 * time.Millisecond)
+			if deadline, ok := ctx.Deadline(); ok && deadline.Before(grace) { grace = deadline }
+			_ = conn.SetReadDeadline(grace)
+			continue
+		}
+
+		if registered && len(parts) >= 2 && (parts[1] == "376" || parts[1] == "422") {
+			finalizeRegistration(conn, &result, caps, serverMetadata)
 			return result, nil
 		}
 	}
+	if registered {
+		finalizeRegistration(conn, &result, caps, serverMetadata)
+		return result, nil
+	}
 	if err := scanner.Err(); err != nil { return result, probeError(CodeIRCReadFailed, "irc_registration", err) }
 	return result, probeError(CodeIRCRegistrationFailed, "irc_registration", errors.New("connection closed before IRC registration completed"))
+}
+
+func finalizeRegistration(conn net.Conn, result *Result, caps map[string]struct{}, serverMetadata ServerMetadata) {
+	_, _ = fmt.Fprint(conn, "QUIT :IRCIntel probe complete\r\n")
+	for capability := range caps { result.Capabilities = append(result.Capabilities, capability) }
+	sort.Strings(result.Capabilities)
+	if serverMetadata.Network != "" || serverMetadata.Software != "" || serverMetadata.SoftwareVersion != "" || len(serverMetadata.ISupport) > 0 {
+		result.ServerMetadata = &serverMetadata
+	}
 }
 
 func dialCandidates(ctx context.Context, network, port string, candidates []string, dial dialContextFunc) (net.Conn, string, error) {
