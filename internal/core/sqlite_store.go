@@ -120,6 +120,32 @@ func (s *SQLiteStore) List(query ObservationQuery) ([]agent.Observation, error) 
 	}
 	defer rows.Close()
 
+	return decodeObservationRows(rows)
+}
+
+func (s *SQLiteStore) LatestEndpointObservations() ([]agent.Observation, error) {
+	if s == nil || s.db == nil {
+		return nil, errors.New("sqlite store is not open")
+	}
+	rows, err := s.db.Query(`
+SELECT payload_json
+FROM (
+    SELECT payload_json,
+           ROW_NUMBER() OVER (
+               PARTITION BY agent_id, endpoint_host, endpoint_port, endpoint_tls
+               ORDER BY observed_at DESC, id DESC
+           ) AS row_number
+    FROM observations
+)
+WHERE row_number = 1`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return decodeObservationRows(rows)
+}
+
+func decodeObservationRows(rows *sql.Rows) ([]agent.Observation, error) {
 	observations := make([]agent.Observation, 0)
 	for rows.Next() {
 		var payload []byte
