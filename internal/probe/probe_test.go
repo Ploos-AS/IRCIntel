@@ -1,8 +1,11 @@
 package probe
 
 import (
+	"bufio"
 	"context"
+	"fmt"
 	"net"
+	"strings"
 	"testing"
 	"time"
 )
@@ -14,27 +17,96 @@ func testRunner(t *testing.T, interval time.Duration) *Runner {
 	return runner
 }
 
-func TestRunPlainIRC(t *testing.T) {
+func serveOnce(t *testing.T, handler func(net.Conn) error) (string, <-chan error) {
+	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil { t.Fatal(err) }
-	defer ln.Close()
-
 	done := make(chan error, 1)
 	go func() {
+		defer ln.Close()
 		conn, err := ln.Accept()
 		if err != nil { done <- err; return }
 		defer conn.Close()
-		buf := make([]byte, 1024)
-		_, _ = conn.Read(buf)
-		_, err = conn.Write([]byte(":test.example CAP IRCIntelProbe LS :multi-prefix sasl server-time\r\n:test.example 001 IRCIntelProbe :welcome\r\n"))
-		done <- err
+		done <- handler(conn)
 	}()
+	return fmtPort(ln.Addr().(*net.TCPAddr).Port), done
+}
 
-	port := ln.Addr().(*net.TCPAddr).Port
-	result, err := testRunner(t, time.Millisecond).Run(context.Background(), Config{Host: "localhost", Port: fmtPort(port), Timeout: 2 * time.Second})
+func readUntil(r *bufio.Reader, want string) error {
+	for {
+		line, err := r.ReadString('\n')
+		if err != nil { return err }
+		if strings.TrimSpace(line) == want { return nil }
+	}
+}
+
+func TestRunPlainIRC(t *testing.T) {
+	port, done := serveOnce(t, func(conn net.Conn) error {
+		r := bufio.NewReader(conn)
+		if err := readUntil(r, "USER ircintel 0 * :IRCIntel test probe | contact: https://example.invalid/ircintel"); err != nil { return err }
+		if _, err := fmt.Fprint(conn, ":test.example CAP IRCIntelProbe LS :multi-prefix sasl server-time\r\n"); err != nil { return err }
+		if err := readUntil(r, "CAP END"); err != nil { return err }
+		_, err := fmt.Fprint(conn, ":test.example 001 IRCIntelProbe :welcome\r\n")
+		return err
+	})
+
+	result, err := testRunner(t, time.Millisecond).Run(context.Background(), Config{Host: "localhost", Port: port, Timeout: 2 * time.Second})
 	if err != nil { t.Fatal(err) }
 	if result.Server != "test.example" { t.Fatalf("server=%q", result.Server) }
 	if len(result.Capabilities) != 3 { t.Fatalf("capabilities=%v", result.Capabilities) }
+	if err := <-done; err != nil { t.Fatal(err) }
+}
+
+func TestRunCAPEndRequiredBeforeWelcome(t *testing.T) {
+	port, done := serveOnce(t, func(conn net.Conn) error {
+		r := bufio.NewReader(conn)
+		if err := readUntil(r, "USER ircintel 0 * :IRCIntel test probe | contact: https://example.invalid/ircintel"); err != nil { return err }
+		if _, err := fmt.Fprint(conn, ":test.example CAP IRCIntelProbe LS :multi-prefix sasl\r\n"); err != nil { return err }
+		if err := readUntil(r, "CAP END"); err != nil { return err }
+		_, err := fmt.Fprint(conn, ":test.example 001 IRCIntelProbe :welcome\r\n")
+		return err
+	})
+
+	if _, err := testRunner(t, time.Millisecond).Run(context.Background(), Config{Host: "localhost", Port: port, Timeout: 2 * time.Second}); err != nil { t.Fatal(err) }
+	if err := <-done; err != nil { t.Fatal(err) }
+}
+
+func TestRunMultilineCAPLS(t *testing.T) {
+	port, done := serveOnce(t, func(conn net.Conn) error {
+		r := bufio.NewReader(conn)
+		if err := readUntil(r, "USER ircintel 0 * :IRCIntel test probe | contact: https://example.invalid/ircintel"); err != nil { return err }
+		if _, err := fmt.Fprint(conn, ":test.example CAP IRCIntelProbe LS * :multi-prefix sasl\r\n"); err != nil { return err }
+		_ = conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+		if line, err := r.ReadString('\n'); err == nil && strings.TrimSpace(line) == "CAP END" {
+			return fmt.Errorf("CAP END sent before final CAP LS line")
+		}
+		_ = conn.SetReadDeadline(time.Time{})
+		if _, err := fmt.Fprint(conn, ":test.example CAP IRCIntelProbe LS :server-time account-tag\r\n"); err != nil { return err }
+		if err := readUntil(r, "CAP END"); err != nil { return err }
+		_, err := fmt.Fprint(conn, ":test.example 001 IRCIntelProbe :welcome\r\n")
+		return err
+	})
+
+	result, err := testRunner(t, time.Millisecond).Run(context.Background(), Config{Host: "localhost", Port: port, Timeout: 2 * time.Second})
+	if err != nil { t.Fatal(err) }
+	want := []string{"account-tag", "multi-prefix", "sasl", "server-time"}
+	if fmt.Sprint(result.Capabilities) != fmt.Sprint(want) { t.Fatalf("capabilities=%v want=%v", result.Capabilities, want) }
+	if err := <-done; err != nil { t.Fatal(err) }
+}
+
+func TestRunRespondsToPINGDuringRegistration(t *testing.T) {
+	port, done := serveOnce(t, func(conn net.Conn) error {
+		r := bufio.NewReader(conn)
+		if err := readUntil(r, "USER ircintel 0 * :IRCIntel test probe | contact: https://example.invalid/ircintel"); err != nil { return err }
+		if _, err := fmt.Fprint(conn, "PING :probe-token\r\n"); err != nil { return err }
+		if err := readUntil(r, "PONG :probe-token"); err != nil { return err }
+		if _, err := fmt.Fprint(conn, ":test.example CAP IRCIntelProbe LS :server-time\r\n"); err != nil { return err }
+		if err := readUntil(r, "CAP END"); err != nil { return err }
+		_, err := fmt.Fprint(conn, ":test.example 001 IRCIntelProbe :welcome\r\n")
+		return err
+	})
+
+	if _, err := testRunner(t, time.Millisecond).Run(context.Background(), Config{Host: "localhost", Port: port, Timeout: 2 * time.Second}); err != nil { t.Fatal(err) }
 	if err := <-done; err != nil { t.Fatal(err) }
 }
 
