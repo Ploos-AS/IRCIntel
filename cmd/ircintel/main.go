@@ -2,10 +2,12 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/Ploos-AS/IRCIntel/internal/core"
@@ -20,12 +22,19 @@ type versionResponse struct {
 	Version string `json:"version"`
 }
 
+type storageConfig struct {
+	Backend     string
+	SQLitePath  string
+	DatabaseURL string
+}
+
 func main() {
 	listen := getenv("IRCINTEL_LISTEN", ":8080")
-	dbPath := getenv("IRCINTEL_DB_PATH", "/data/ircintel.db")
 	statusFreshness, err := getenvDuration("IRCINTEL_STATUS_FRESHNESS", defaultStatusFreshness)
 	if err != nil { log.Fatalf("configure status freshness: %v", err) }
-	store, err := core.OpenSQLiteStore(dbPath)
+	storage, err := storageConfigFromEnv()
+	if err != nil { log.Fatalf("configure storage: %v", err) }
+	store, err := openStorage(storage)
 	if err != nil { log.Fatalf("open observation store: %v", err) }
 	defer store.Close()
 	token := os.Getenv("IRCINTEL_CORE_TOKEN")
@@ -74,8 +83,38 @@ func main() {
 	mux.Handle("GET /api/v1/probe-plan", probePlan)
 
 	srv := &http.Server{Addr: listen, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
-	log.Printf("IRCIntel %s listening on %s", version, listen)
+	log.Printf("IRCIntel %s listening on %s (storage=%s)", version, listen, storage.Backend)
 	log.Fatal(srv.ListenAndServe())
+}
+
+func storageConfigFromEnv() (storageConfig, error) {
+	backend := strings.ToLower(strings.TrimSpace(getenv("IRCINTEL_STORAGE_BACKEND", "sqlite")))
+	cfg := storageConfig{
+		Backend:     backend,
+		SQLitePath:  strings.TrimSpace(getenv("IRCINTEL_DB_PATH", "/data/ircintel.db")),
+		DatabaseURL: strings.TrimSpace(os.Getenv("IRCINTEL_DATABASE_URL")),
+	}
+	switch backend {
+	case "sqlite":
+		if cfg.SQLitePath == "" { return storageConfig{}, errors.New("IRCINTEL_DB_PATH is required for sqlite storage") }
+		if cfg.DatabaseURL != "" { return storageConfig{}, errors.New("IRCINTEL_DATABASE_URL is only valid with postgres storage") }
+	case "postgres":
+		if cfg.DatabaseURL == "" { return storageConfig{}, errors.New("IRCINTEL_DATABASE_URL is required for postgres storage") }
+	default:
+		return storageConfig{}, fmt.Errorf("unsupported IRCINTEL_STORAGE_BACKEND %q", backend)
+	}
+	return cfg, nil
+}
+
+func openStorage(cfg storageConfig) (*core.SQLiteStore, error) {
+	switch cfg.Backend {
+	case "sqlite":
+		return core.OpenSQLiteStore(cfg.SQLitePath)
+	case "postgres":
+		return nil, errors.New("postgres storage backend is reserved but not implemented yet")
+	default:
+		return nil, fmt.Errorf("unsupported storage backend %q", cfg.Backend)
+	}
 }
 
 func getenv(key, fallback string) string { if value := os.Getenv(key); value != "" { return value }; return fallback }
