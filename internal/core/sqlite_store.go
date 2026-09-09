@@ -150,9 +150,12 @@ func (s *SQLiteStore) normalizeLegacyTimes() error {
 
 func (s *SQLiteStore) Store(observation agent.Observation) error {
 	if s==nil||s.db==nil{return errors.New("sqlite store is not open")};payload,err:=json.Marshal(observation);if err!=nil{return err}
-	result,err:=s.db.Exec(`INSERT OR IGNORE INTO observations (agent_id, observed_at, endpoint_host, endpoint_port, endpoint_tls, payload_json) VALUES (?, ?, ?, ?, ?, ?)`,observation.AgentID,formatObservationTime(observation.ObservedAt),observation.Endpoint.Host,observation.Endpoint.Port,observation.Endpoint.TLS,payload);if err!=nil{return err}
-	rows,err:=result.RowsAffected();if err!=nil{return err};if rows==0{return nil}
-	if err:=s.refreshIncidentRecords();err!=nil{return err};return s.refreshNetworkIncidentRecords()
+	tx,err:=s.db.Begin();if err!=nil{return err};defer tx.Rollback()
+	result,err:=tx.Exec(`INSERT OR IGNORE INTO observations (agent_id, observed_at, endpoint_host, endpoint_port, endpoint_tls, payload_json) VALUES (?, ?, ?, ?, ?, ?)`,observation.AgentID,formatObservationTime(observation.ObservedAt),observation.Endpoint.Host,observation.Endpoint.Port,observation.Endpoint.TLS,payload);if err!=nil{return err}
+	rows,err:=result.RowsAffected();if err!=nil{return err};if rows==0{return tx.Commit()}
+	if err:=refreshIncidentRecordsTx(tx);err!=nil{return err}
+	if err:=refreshNetworkIncidentRecordsTx(tx);err!=nil{return err}
+	return tx.Commit()
 }
 
 func (s *SQLiteStore) List(query ObservationQuery) ([]agent.Observation,error){if s==nil||s.db==nil{return nil,errors.New("sqlite store is not open")};if query.Limit<1||query.Limit>maxObservationLimit{return nil,errors.New("invalid observation limit")};if !query.Since.IsZero()&&!query.Until.IsZero()&&query.Since.After(query.Until){return nil,errors.New("invalid observation time range")};where:=make([]string,0,4);args:=make([]any,0,5);if query.AgentID!=""{where=append(where,"agent_id = ?");args=append(args,query.AgentID)};if query.Host!=""{where=append(where,"endpoint_host = ?");args=append(args,query.Host)};if !query.Since.IsZero(){where=append(where,"observed_at >= ?");args=append(args,formatObservationTime(query.Since))};if !query.Until.IsZero(){where=append(where,"observed_at <= ?");args=append(args,formatObservationTime(query.Until))};statement:="SELECT payload_json FROM observations";if len(where)>0{statement+=" WHERE "+strings.Join(where," AND ")};statement+=" ORDER BY observed_at DESC, id DESC LIMIT ?";args=append(args,query.Limit);rows,err:=s.db.Query(statement,args...);if err!=nil{return nil,err};defer rows.Close();return decodeObservationRows(rows)}
