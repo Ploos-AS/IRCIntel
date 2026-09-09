@@ -8,6 +8,18 @@ import (
 	"time"
 )
 
+func errorTestRunner(t *testing.T) *Runner {
+	t.Helper()
+	runner, err := NewRunner(
+		Identity{Nick: "IRCIntelProbe", Username: "ircintel", Realname: "IRCIntel test probe", Contact: "https://example.invalid/ircintel"},
+		Policy{AllowHosts: []string{"127.0.0.1"}, MinInterval: time.Millisecond},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return runner
+}
+
 func TestErrorInfo(t *testing.T) {
 	err := probeError(CodeTLSHandshakeFailed, "tls", errors.New("boom"))
 	code, stage := ErrorInfo(err)
@@ -21,7 +33,7 @@ func TestErrorInfo(t *testing.T) {
 }
 
 func TestRunNoIPv6AddressCode(t *testing.T) {
-	_, err := testRunner(t, time.Millisecond).Run(context.Background(), Config{Host: "127.0.0.1", Port: "1", Family: "ipv6", Timeout: time.Second})
+	_, err := errorTestRunner(t).Run(context.Background(), Config{Host: "127.0.0.1", Port: "1", Family: "ipv6", Timeout: time.Second})
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -33,11 +45,13 @@ func TestRunNoIPv6AddressCode(t *testing.T) {
 
 func TestRunTCPConnectFailureCode(t *testing.T) {
 	ln, err := net.Listen("tcp4", "127.0.0.1:0")
-	if err != nil { t.Fatal(err) }
+	if err != nil {
+		t.Fatal(err)
+	}
 	port := fmtPort(ln.Addr().(*net.TCPAddr).Port)
 	_ = ln.Close()
 
-	_, err = testRunner(t, time.Millisecond).Run(context.Background(), Config{Host: "127.0.0.1", Port: port, Family: "ipv4", Timeout: time.Second})
+	_, err = errorTestRunner(t).Run(context.Background(), Config{Host: "127.0.0.1", Port: port, Family: "ipv4", Timeout: time.Second})
 	if err == nil {
 		t.Fatal("expected error")
 	}
