@@ -9,7 +9,7 @@ import (
 	"github.com/Ploos-AS/IRCIntel/internal/probe"
 )
 
-func TestIncidentRecordsPersistAndClose(t *testing.T) {
+func TestIncidentRecordsPersistCloseAndFilter(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "ircintel.db")
 	store, err := OpenSQLiteStore(path)
 	if err != nil { t.Fatal(err) }
@@ -25,7 +25,7 @@ func TestIncidentRecordsPersistAndClose(t *testing.T) {
 		if err := store.Store(item); err != nil { t.Fatal(err) }
 	}
 
-	records, err := store.ListIncidentRecords(10)
+	records, err := store.ListIncidentRecords(IncidentRecordQuery{Status: "open", Host: "irc.example", Since: base, Until: base.Add(5 * time.Minute), Limit: 10})
 	if err != nil { t.Fatal(err) }
 	if len(records) != 1 || records[0].Status != "open" { t.Fatalf("records=%+v", records) }
 
@@ -36,7 +36,7 @@ func TestIncidentRecordsPersistAndClose(t *testing.T) {
 		if err := store.Store(item); err != nil { t.Fatal(err) }
 	}
 
-	records, err = store.ListIncidentRecords(10)
+	records, err = store.ListIncidentRecords(IncidentRecordQuery{Status: "closed", Host: "irc.example", Limit: 10})
 	if err != nil { t.Fatal(err) }
 	if len(records) != 1 || records[0].Status != "closed" || records[0].DurationSeconds == nil {
 		t.Fatalf("records=%+v", records)
@@ -46,9 +46,23 @@ func TestIncidentRecordsPersistAndClose(t *testing.T) {
 	store, err = OpenSQLiteStore(path)
 	if err != nil { t.Fatal(err) }
 	defer store.Close()
-	records, err = store.ListIncidentRecords(10)
+	records, err = store.ListIncidentRecords(IncidentRecordQuery{Limit: 10})
 	if err != nil { t.Fatal(err) }
 	if len(records) != 1 || records[0].Status != "closed" {
 		t.Fatalf("reopened records=%+v", records)
+	}
+}
+
+func TestIncidentRecordQueryValidation(t *testing.T) {
+	store, err := OpenSQLiteStore(filepath.Join(t.TempDir(), "ircintel.db"))
+	if err != nil { t.Fatal(err) }
+	defer store.Close()
+
+	if _, err := store.ListIncidentRecords(IncidentRecordQuery{Status: "wat", Limit: 10}); err == nil {
+		t.Fatal("expected invalid status")
+	}
+	base := time.Date(2026, 9, 9, 7, 0, 0, 0, time.UTC)
+	if _, err := store.ListIncidentRecords(IncidentRecordQuery{Since: base.Add(time.Minute), Until: base, Limit: 10}); err == nil {
+		t.Fatal("expected invalid time range")
 	}
 }
