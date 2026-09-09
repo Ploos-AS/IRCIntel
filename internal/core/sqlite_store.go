@@ -15,7 +15,7 @@ import (
 )
 
 const observationTimeLayout = "2006-01-02T15:04:05.000000000Z"
-const sqliteSchemaVersion = 3
+const sqliteSchemaVersion = 4
 
 type SQLiteStore struct { db *sql.DB }
 
@@ -130,6 +130,14 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_observations_identity
     ON observations(agent_id, observed_at, endpoint_host, COALESCE(endpoint_port, ''), endpoint_tls);`)
 			return err
 		}); err != nil { return err }
+		version = 3
+	}
+
+	// M3.23 completes fixed-width UTC timestamp normalization for persisted
+	// network incidents. Older rows may contain variable-width RFC3339Nano values,
+	// which are unsafe for SQLite's lexical ordering and range filtering.
+	if version == 3 {
+		if err := s.runMigration(4, normalizeNetworkIncidentTimesTx); err != nil { return err }
 	}
 	return nil
 }
@@ -165,6 +173,28 @@ func normalizeLegacyTimesTx(tx *sql.Tx) error {
 	if err:=incidentRows.Err();err!=nil{_ = incidentRows.Close();return err};if err:=incidentRows.Close();err!=nil{return err}
 	for _,u:=range observationUpdates{if _,err:=tx.Exec(`UPDATE observations SET observed_at = ? WHERE id = ?`,u.value,u.id);err!=nil{return err}}
 	for _,u:=range incidentUpdates{if _,err:=tx.Exec(`UPDATE incident_records SET started_at = ? WHERE id = ?`,u.value,u.id);err!=nil{return err}}
+	return nil
+}
+
+func normalizeNetworkIncidentTimesTx(tx *sql.Tx) error {
+	if tx == nil { return errors.New("sqlite transaction is required") }
+	type timestampUpdate struct { id int64; value string }
+	rows, err := tx.Query(`SELECT id, payload_json FROM network_incident_records`)
+	if err != nil { return err }
+	updates := make([]timestampUpdate, 0)
+	for rows.Next() {
+		var id int64
+		var payload []byte
+		if err := rows.Scan(&id, &payload); err != nil { _ = rows.Close(); return err }
+		var incident NetworkIncident
+		if err := json.Unmarshal(payload, &incident); err != nil { _ = rows.Close(); return err }
+		updates = append(updates, timestampUpdate{id: id, value: formatObservationTime(incident.StartedAt)})
+	}
+	if err := rows.Err(); err != nil { _ = rows.Close(); return err }
+	if err := rows.Close(); err != nil { return err }
+	for _, update := range updates {
+		if _, err := tx.Exec(`UPDATE network_incident_records SET started_at = ? WHERE id = ?`, update.value, update.id); err != nil { return err }
+	}
 	return nil
 }
 
