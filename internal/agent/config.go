@@ -33,10 +33,16 @@ func ConfigFromEnv() (Config, error) {
 	if err != nil || parsedInterval <= 0 { return cfg, errors.New("IRCINTEL_AGENT_INTERVAL must be a positive duration") }
 	cfg.Interval = parsedInterval
 
+	cfg.CoreURL = strings.TrimSpace(os.Getenv("IRCINTEL_CORE_URL"))
+	cfg.CoreToken = strings.TrimSpace(os.Getenv("IRCINTEL_CORE_TOKEN"))
+
 	targets := strings.TrimSpace(os.Getenv("IRCINTEL_AGENT_TARGETS"))
-	if targets == "" { return cfg, errors.New("IRCINTEL_AGENT_TARGETS is required") }
-	if err := json.Unmarshal([]byte(targets), &cfg.Endpoints); err != nil { return cfg, err }
-	if len(cfg.Endpoints) == 0 { return cfg, errors.New("IRCINTEL_AGENT_TARGETS must contain at least one endpoint") }
+	if targets != "" {
+		if err := json.Unmarshal([]byte(targets), &cfg.Endpoints); err != nil { return cfg, err }
+		if len(cfg.Endpoints) == 0 { return cfg, errors.New("IRCINTEL_AGENT_TARGETS must contain at least one endpoint") }
+	} else if cfg.CoreURL == "" {
+		return cfg, errors.New("IRCINTEL_AGENT_TARGETS or IRCINTEL_CORE_URL is required")
+	}
 
 	contact := strings.TrimSpace(os.Getenv("IRCINTEL_AGENT_CONTACT"))
 	if contact == "" { return cfg, errors.New("IRCINTEL_AGENT_CONTACT is required") }
@@ -46,8 +52,6 @@ func ConfigFromEnv() (Config, error) {
 	if username == "" { username = "ircintel" }
 	cfg.Identity = probe.Identity{Nick: nick, Username: username, Realname: "IRCIntel distributed probe", Contact: contact}
 
-	cfg.CoreURL = strings.TrimSpace(os.Getenv("IRCINTEL_CORE_URL"))
-	cfg.CoreToken = strings.TrimSpace(os.Getenv("IRCINTEL_CORE_TOKEN"))
 	cfg.Retries = 3
 	if raw := strings.TrimSpace(os.Getenv("IRCINTEL_AGENT_RETRIES")); raw != "" {
 		retries, err := strconv.Atoi(raw)
@@ -55,15 +59,19 @@ func ConfigFromEnv() (Config, error) {
 		cfg.Retries = retries
 	}
 
-	allowHosts := make([]string, 0, len(cfg.Endpoints))
+	cfg.Policy = PolicyForEndpoints(cfg.Endpoints, cfg.Interval)
+	return cfg, nil
+}
+
+func PolicyForEndpoints(endpoints []Endpoint, interval time.Duration) probe.Policy {
+	allowHosts := make([]string, 0, len(endpoints))
 	seen := map[string]struct{}{}
-	for _, endpoint := range cfg.Endpoints {
+	for _, endpoint := range endpoints {
 		host := strings.TrimSpace(endpoint.Host)
-		if host == "" { return cfg, errors.New("agent endpoint host is required") }
+		if host == "" { continue }
 		if _, ok := seen[host]; ok { continue }
 		seen[host] = struct{}{}
 		allowHosts = append(allowHosts, host)
 	}
-	cfg.Policy = probe.Policy{AllowHosts: allowHosts, MinInterval: cfg.Interval}
-	return cfg, nil
+	return probe.Policy{AllowHosts: allowHosts, MinInterval: interval}
 }
