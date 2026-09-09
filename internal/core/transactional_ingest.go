@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"sort"
+	"strings"
 
 	"github.com/Ploos-AS/IRCIntel/internal/agent"
 )
@@ -69,13 +70,23 @@ func recentObservationsTx(tx *sql.Tx, limit int) ([]agent.Observation, error) {
 
 // refreshNetworkIncidentRecordsTx performs the canonical network-level
 // derivation inside the same transaction as observation and endpoint-incident
-// persistence.
+// persistence. M3.25 scopes the expensive incident-history read to networks
+// containing the observation that triggered this ingest instead of rescanning
+// every network's endpoint incidents on every write.
 func refreshNetworkIncidentRecordsTx(tx *sql.Tx) error {
+	networkIDs, err := affectedNetworkIDsForLatestObservationTx(tx)
+	if err != nil {
+		return err
+	}
+	if len(networkIDs) == 0 {
+		return nil
+	}
+
 	snapshot, err := registrySnapshotTx(tx)
 	if err != nil {
 		return err
 	}
-	endpoints, err := allIncidentRecordsTx(tx)
+	endpoints, err := incidentRecordsForNetworksTx(tx, networkIDs)
 	if err != nil {
 		return err
 	}
@@ -96,12 +107,80 @@ status=excluded.status, severity=excluded.severity, payload_json=excluded.payloa
 	return nil
 }
 
+func affectedNetworkIDsForLatestObservationTx(tx *sql.Tx) ([]string, error) {
+	var host, port string
+	var tls bool
+	if err := tx.QueryRow(`SELECT endpoint_host, COALESCE(endpoint_port, ''), endpoint_tls FROM observations ORDER BY id DESC LIMIT 1`).Scan(&host, &port, &tls); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	rows, err := tx.Query(`
+SELECT DISTINCT ns.network_id
+FROM network_endpoints ne
+JOIN network_servers ns ON ns.id = ne.server_id
+WHERE ne.host = ? AND ne.port = ? AND ne.tls = ?
+ORDER BY ns.network_id`, host, port, tls)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]string, 0)
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func incidentRecordsForNetworksTx(tx *sql.Tx, networkIDs []string) ([]IncidentLifecycle, error) {
+	if len(networkIDs) == 0 {
+		return []IncidentLifecycle{}, nil
+	}
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(networkIDs)), ",")
+	args := make([]any, len(networkIDs))
+	for i, id := range networkIDs {
+		args[i] = id
+	}
+	statement := `
+SELECT ir.payload_json
+FROM incident_records ir
+WHERE EXISTS (
+    SELECT 1
+    FROM network_endpoints ne
+    JOIN network_servers ns ON ns.id = ne.server_id
+    WHERE ne.host = ir.endpoint_host
+      AND ne.port = COALESCE(ir.endpoint_port, '')
+      AND ne.tls = ir.endpoint_tls
+      AND ns.network_id IN (` + placeholders + `)
+)
+ORDER BY ir.started_at DESC, ir.id DESC`
+	rows, err := tx.Query(statement, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return decodeIncidentLifecycleRows(rows)
+}
+
 func allIncidentRecordsTx(tx *sql.Tx) ([]IncidentLifecycle, error) {
 	rows, err := tx.Query(`SELECT payload_json FROM incident_records ORDER BY started_at DESC, id DESC`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
+	return decodeIncidentLifecycleRows(rows)
+}
+
+func decodeIncidentLifecycleRows(rows *sql.Rows) ([]IncidentLifecycle, error) {
 	out := make([]IncidentLifecycle, 0)
 	for rows.Next() {
 		var payload []byte
