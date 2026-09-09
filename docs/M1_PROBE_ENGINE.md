@@ -15,7 +15,7 @@ A probe performs, in order:
 7. IRCv3 capability discovery with `CAP LS 302`, including multiline responses and `CAP END`.
 8. Registration-time `PING` handling with corresponding `PONG`.
 9. Passive capture of public registration metadata from numerics such as `004` and `005 ISUPPORT`.
-10. Successful-registration detection from numeric `001`.
+10. Successful-registration detection from numeric `001`, followed by completion of the registration burst through `376` (end of MOTD) or `422` (no MOTD), with a short bounded grace period for servers that omit both.
 11. Clean `QUIT` after the measurement.
 
 The structured result records all resolved addresses, the address that ultimately succeeded, the requested/normalized address family, stage latencies, TLS metadata when applicable, the responding server name, advertised IRCv3 capabilities, and public server metadata announced during registration.
@@ -74,6 +74,8 @@ M1.7 records only metadata the server already announces during the normal regist
 
 ISUPPORT is stored as key/value data so later core components can compare protocol features across networks without parsing raw IRC lines. Missing metadata remains absent rather than guessed.
 
+M1.10 keeps reading after `001` because real IRC servers commonly send `004`, one or more `005` lines, and MOTD numerics after the welcome numeric. The probe completes immediately at `376` or `422`; if neither arrives, a short post-`001` read grace bounds the measurement and a connection close or read timeout after successful `001` is still treated as a successful registration. MOTD text itself is not stored.
+
 ## Safety and privacy
 
 The M1 probe does not join channels and does not collect `PRIVMSG`, `NOTICE`, channel messages, user histories or credentials. It performs only the minimum protocol exchange needed to measure a public IRC endpoint.
@@ -92,7 +94,7 @@ Endpoint-model qualification covers mixed-family outcomes and verifies that one 
 
 Failure-taxonomy qualification locks stable code/stage mappings for address-selection, policy, and TCP failures and verifies that endpoint family observations expose those fields.
 
-Server-metadata qualification verifies deterministic parsing of numeric `004`, `005 ISUPPORT`, `NETWORK=`, and the structured ISUPPORT map, plus end-to-end capture during a synthetic registration exchange.
+Server-metadata qualification verifies deterministic parsing of numeric `004`, `005 ISUPPORT`, `NETWORK=`, and the structured ISUPPORT map, plus end-to-end capture in realistic `001` -> `004`/`005` -> `376` order. A separate test verifies `422` as a successful registration-burst terminator.
 
 CI must continue to pass `go test ./...`, `go vet ./...`, the application build, and the M0.1 OCI runtime gate.
 
