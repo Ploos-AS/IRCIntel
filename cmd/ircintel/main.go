@@ -34,6 +34,7 @@ func main() {
 	incidentLifecycle := core.IncidentLifecycleHandler{Token: token, Reader: store}
 	registry := core.RegistryHandler{Token: token, Reader: store}
 	registryWrite := core.RegistryWriteHandler{Token: token, Writer: store}
+	discovery := core.DiscoveryHandler{Token: token, Store: store}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
@@ -55,6 +56,8 @@ func main() {
 	mux.HandleFunc("POST /api/v1/registry/networks", registryWrite.Network)
 	mux.HandleFunc("POST /api/v1/registry/servers", registryWrite.Server)
 	mux.HandleFunc("POST /api/v1/registry/endpoints", registryWrite.Endpoint)
+	mux.HandleFunc("GET /api/v1/discovery/candidates", discovery.List)
+	mux.HandleFunc("POST /api/v1/discovery/candidates", discovery.Intake)
 
 	srv := &http.Server{
 		Addr:              listen,
