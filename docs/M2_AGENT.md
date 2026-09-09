@@ -45,13 +45,44 @@ The endpoint returns newest observations first and supports exact filters:
 - `host=<hostname>`
 - `limit=<1..500>`, default `50`
 
-When `IRCINTEL_CORE_TOKEN` is configured, reads use the same bearer authentication as ingestion. This keeps the development Core closed by default while preserving a clean boundary for a later intentionally public API.
+When `IRCINTEL_CORE_TOKEN` is configured, reads use the same bearer authentication as ingestion.
 
 Responses use a stable envelope:
 
 ```json
 {"observations": []}
 ```
+
+## M2.5 historical time ranges
+
+Observation reads also accept RFC3339/RFC3339Nano time bounds:
+
+- `since=<timestamp>`
+- `until=<timestamp>`
+
+Bounds are inclusive, combine with the other filters, and invalid timestamps or reversed ranges are rejected with `400 Bad Request`.
+
+## M2.6 distributed endpoint status
+
+M2.6 adds `GET /api/v1/endpoints/status`.
+
+Core selects the newest stored observation for every unique `(agent_id, host, port, tls)` tuple, then aggregates those latest regional views by endpoint. This prevents a single probe location from unilaterally defining endpoint health.
+
+Each endpoint summary exposes:
+
+- `status`: `up`, `degraded`, or `down`
+- total contributing `agents`
+- `reachable_agents`
+- `dual_stack_agents`
+- `latest_observed_at`
+
+Status semantics are intentionally simple and deterministic:
+
+- `up`: all contributing agents report the endpoint reachable
+- `degraded`: only some contributing agents report it reachable
+- `down`: no contributing agent reports it reachable
+
+The endpoint uses the same optional Core bearer authentication as the observation API.
 
 ## Configuration
 
@@ -96,4 +127,4 @@ The M2 agent inherits the M1 privacy model. It does not join channels, collect m
 
 ## Qualification
 
-M2 qualification verifies agent serialization/configuration, HTTP submission/authentication/retry behavior, Core ingest validation, SQLite persistence across close/reopen, filtered observation reads, result ordering, bounded query limits, and read authentication. CI must continue to pass `go mod tidy` with a clean dependency diff, `go test ./...`, `go vet ./...`, application builds, and the OCI runtime gate.
+M2 qualification verifies agent serialization/configuration, HTTP submission/authentication/retry behavior, Core ingest validation, SQLite persistence across close/reopen, filtered and time-bounded observation reads, distributed endpoint aggregation, status semantics, read authentication, dependency cleanliness, application builds, and the OCI runtime gate.
