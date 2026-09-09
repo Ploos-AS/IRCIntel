@@ -9,10 +9,11 @@ import (
 	"time"
 
 	"github.com/Ploos-AS/IRCIntel/internal/agent"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-const postgresSchemaVersion = 1
+const postgresSchemaVersion = 2
 const postgresOperationTimeout = 10 * time.Second
 
 type PostgresStore struct {
@@ -71,8 +72,7 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 	}
 
 	var version int
-	err = tx.QueryRow(ctx, `SELECT COALESCE(MAX(version), 0) FROM schema_migrations`).Scan(&version)
-	if err != nil {
+	if err := tx.QueryRow(ctx, `SELECT COALESCE(MAX(version), 0) FROM schema_migrations`).Scan(&version); err != nil {
 		return fmt.Errorf("read postgres schema version: %w", err)
 	}
 	if version > postgresSchemaVersion {
@@ -120,6 +120,15 @@ CREATE INDEX IF NOT EXISTS idx_pg_network_endpoints_server ON network_endpoints(
 		if _, err := tx.Exec(ctx, `INSERT INTO schema_migrations(version) VALUES (1)`); err != nil {
 			return fmt.Errorf("record postgres migration v1: %w", err)
 		}
+		version = 1
+	}
+	if version < 2 {
+		if err := migratePostgresIncidentState(ctx, tx); err != nil {
+			return fmt.Errorf("apply postgres migration v2: %w", err)
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO schema_migrations(version) VALUES (2)`); err != nil {
+			return fmt.Errorf("record postgres migration v2: %w", err)
+		}
 	}
 	return tx.Commit(ctx)
 }
@@ -134,18 +143,45 @@ func (s *PostgresStore) Store(observation agent.Observation) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), postgresOperationTimeout)
 	defer cancel()
-	_, err = s.pool.Exec(ctx, `
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	var insertedID int64
+	err = tx.QueryRow(ctx, `
 INSERT INTO observations (agent_id, observed_at, endpoint_host, endpoint_port, endpoint_tls, payload_json)
 VALUES ($1, $2, $3, $4, $5, $6)
-ON CONFLICT (agent_id, observed_at, endpoint_host, endpoint_port, endpoint_tls) DO NOTHING`,
+ON CONFLICT (agent_id, observed_at, endpoint_host, endpoint_port, endpoint_tls) DO NOTHING
+RETURNING id`,
 		observation.AgentID,
 		observation.ObservedAt.UTC(),
 		observation.Endpoint.Host,
 		observation.Endpoint.Port,
 		observation.Endpoint.TLS,
 		payload,
-	)
-	return err
+	).Scan(&insertedID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return tx.Commit(ctx)
+	}
+	if err != nil {
+		return err
+	}
+
+	transitioned, err := persistPostgresTransitionForObservationTx(ctx, tx, observation)
+	if err != nil {
+		return err
+	}
+	if transitioned {
+		if err := refreshPostgresIncidentRecordsForEndpointTx(ctx, tx, observation.Endpoint.Host, observation.Endpoint.Port, observation.Endpoint.TLS); err != nil {
+			return err
+		}
+	}
+	if err := upsertPostgresAgentEndpointStateTx(ctx, tx, observation); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 func (s *PostgresStore) List(query ObservationQuery) ([]agent.Observation, error) {
