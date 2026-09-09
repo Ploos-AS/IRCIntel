@@ -19,12 +19,24 @@ func TestConfigFromEnv(t *testing.T) {
 	if cfg.Identity.Nick != "IRCIntelProbe" || cfg.Identity.Username != "ircintel" { t.Fatalf("identity=%+v", cfg.Identity) }
 }
 
-func TestConfigFromEnvRequiresIdentityAndTargets(t *testing.T) {
+func TestConfigFromEnvAllowsCoreProbePlan(t *testing.T) {
+	t.Setenv("IRCINTEL_AGENT_ID", "oslo-1")
+	t.Setenv("IRCINTEL_AGENT_CONTACT", "https://example.invalid/ircintel")
+	t.Setenv("IRCINTEL_AGENT_TARGETS", "")
+	t.Setenv("IRCINTEL_CORE_URL", "https://core.example.invalid")
+	cfg, err := ConfigFromEnv()
+	if err != nil { t.Fatal(err) }
+	if len(cfg.Endpoints) != 0 { t.Fatalf("endpoints=%v", cfg.Endpoints) }
+	if cfg.CoreURL == "" { t.Fatal("expected core URL") }
+}
+
+func TestConfigFromEnvRequiresIdentityAndTargetSource(t *testing.T) {
 	t.Setenv("IRCINTEL_AGENT_ID", "")
 	if _, err := ConfigFromEnv(); err == nil { t.Fatal("expected agent id error") }
 
 	t.Setenv("IRCINTEL_AGENT_ID", "oslo-1")
 	t.Setenv("IRCINTEL_AGENT_CONTACT", "https://example.invalid/ircintel")
 	t.Setenv("IRCINTEL_AGENT_TARGETS", "")
-	if _, err := ConfigFromEnv(); err == nil { t.Fatal("expected target error") }
+	t.Setenv("IRCINTEL_CORE_URL", "")
+	if _, err := ConfigFromEnv(); err == nil { t.Fatal("expected target source error") }
 }
