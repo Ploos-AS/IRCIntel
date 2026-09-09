@@ -17,7 +17,6 @@ type Config struct {
 	Port       string
 	TLS        bool
 	ServerName string
-	Nick       string
 	Timeout    time.Duration
 }
 
@@ -34,14 +33,12 @@ type Result struct {
 	Server            string   `json:"server,omitempty"`
 }
 
-func Run(ctx context.Context, cfg Config) (Result, error) {
-	if cfg.Host == "" {
-		return Result{}, errors.New("probe host is required")
-	}
+func (r *Runner) Run(ctx context.Context, cfg Config) (Result, error) {
+	if cfg.Host == "" { return Result{}, errors.New("probe host is required") }
+	if err := r.authorize(cfg.Host); err != nil { return Result{Host: cfg.Host}, err }
 	if cfg.Port == "" {
 		if cfg.TLS { cfg.Port = "6697" } else { cfg.Port = "6667" }
 	}
-	if cfg.Nick == "" { cfg.Nick = "IRCIntelProbe" }
 	if cfg.Timeout <= 0 { cfg.Timeout = 10 * time.Second }
 
 	ctx, cancel := context.WithTimeout(ctx, cfg.Timeout)
@@ -74,8 +71,12 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 
 	deadline, ok := ctx.Deadline()
 	if ok { _ = conn.SetDeadline(deadline) }
+	realname := strings.TrimSpace(r.identity.Realname)
+	if realname == "" { realname = "IRCIntel network probe" }
+	realname += " | contact: " + r.identity.Contact
+
 	registrationStart := time.Now()
-	if _, err := fmt.Fprintf(conn, "CAP LS 302\r\nNICK %s\r\nUSER ircintel 0 * :IRCIntel network probe\r\n", cfg.Nick); err != nil {
+	if _, err := fmt.Fprintf(conn, "CAP LS 302\r\nNICK %s\r\nUSER %s 0 * :%s\r\n", r.identity.Nick, r.identity.Username, realname); err != nil {
 		return result, fmt.Errorf("irc registration write: %w", err)
 	}
 
@@ -84,18 +85,16 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 	for scanner.Scan() {
 		line := scanner.Text()
 		parts := strings.Fields(line)
-		if len(parts) > 0 && strings.HasPrefix(parts[0], ":") && result.Server == "" {
-			result.Server = strings.TrimPrefix(parts[0], ":")
-		}
+		if len(parts) > 0 && strings.HasPrefix(parts[0], ":") && result.Server == "" { result.Server = strings.TrimPrefix(parts[0], ":") }
 		if strings.Contains(line, " CAP ") && strings.Contains(line, " LS ") {
 			if idx := strings.Index(line, " :"); idx >= 0 {
-				for _, cap := range strings.Fields(line[idx+2:]) { caps[cap] = struct{}{} }
+				for _, capability := range strings.Fields(line[idx+2:]) { caps[capability] = struct{}{} }
 			}
 		}
 		if len(parts) >= 2 && parts[1] == "001" {
 			result.RegistrationMS = time.Since(registrationStart).Milliseconds()
 			_, _ = fmt.Fprint(conn, "QUIT :IRCIntel probe complete\r\n")
-			for cap := range caps { result.Capabilities = append(result.Capabilities, cap) }
+			for capability := range caps { result.Capabilities = append(result.Capabilities, capability) }
 			sort.Strings(result.Capabilities)
 			return result, nil
 		}
