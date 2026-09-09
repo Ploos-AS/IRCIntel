@@ -5,6 +5,12 @@ services:
     image: ghcr.io/ploos-as/ircintel:latest
     environment:
       IRCINTEL_LISTEN: ":8080"
+      IRCINTEL_DB_PATH: "/data/ircintel.db"
     ports:
       - "8080:8080"
+    volumes:
+      - ircintel-data:/data
     restart: unless-stopped
+
+volumes:
+  ircintel-data:
