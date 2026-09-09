@@ -10,21 +10,18 @@ import (
 	"github.com/Ploos-AS/IRCIntel/internal/agent"
 )
 
-// refreshIncidentRecordsTx derives and persists incidents only for the endpoint
-// touched by the observation that triggered the current transaction. M3.27 also
-// bounds replay using the newest persisted lifecycle for that endpoint. The
-// first incident still bootstraps from full endpoint history; later refreshes
-// replay from one correlation window before the persisted lifecycle plus one
-// pre-window baseline observation for every agent active in that replay window.
+// refreshIncidentRecordsTx derives and persists endpoint incidents from the
+// persisted transition-event stream. M3.29 removes raw observation replay from
+// the normal incident-maintenance path; observations are now only the source of
+// a transition when persisted agent state actually changes.
 func refreshIncidentRecordsTx(tx *sql.Tx) error {
-	observations, err := observationsForLatestEndpointTx(tx)
+	events, err := transitionEventsForLatestEndpointTx(tx)
 	if err != nil {
 		return err
 	}
-	if len(observations) == 0 {
+	if len(events) == 0 {
 		return nil
 	}
-	events := deriveIncidentEvents(observations)
 	correlated := correlateIncidentEvents(events, defaultCorrelationWindow)
 	lifecycles := pairIncidentLifecycle(correlated)
 	for _, lifecycle := range lifecycles {
@@ -51,6 +48,8 @@ DO UPDATE SET status = excluded.status, payload_json = excluded.payload_json`,
 	return nil
 }
 
+// M3.27 observation replay helpers remain available for regression comparison
+// and explicit reconstruction paths, but normal ingest no longer calls them.
 func observationsForLatestEndpointTx(tx *sql.Tx) ([]agent.Observation, error) {
 	var host, port string
 	var tls bool
