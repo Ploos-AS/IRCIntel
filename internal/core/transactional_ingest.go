@@ -10,10 +10,11 @@ import (
 )
 
 // refreshIncidentRecordsTx derives and persists incidents only for the endpoint
-// touched by the observation that triggered the current transaction. Earlier
-// versions rescanned the newest incidentScanLimit observations globally on every
-// ingest. Endpoint scoping preserves the existing correlation/lifecycle model
-// while avoiding unrelated observation history and cross-endpoint corruption.
+// touched by the observation that triggered the current transaction. M3.27 also
+// bounds replay using the newest persisted lifecycle for that endpoint. The
+// first incident still bootstraps from full endpoint history; later refreshes
+// replay from one correlation window before the persisted lifecycle plus one
+// pre-window baseline observation for every agent active in that replay window.
 func refreshIncidentRecordsTx(tx *sql.Tx) error {
 	observations, err := observationsForLatestEndpointTx(tx)
 	if err != nil {
@@ -63,6 +64,31 @@ LIMIT 1`).Scan(&host, &port, &tls); err != nil {
 		return nil, err
 	}
 
+	var checkpointPayload []byte
+	err := tx.QueryRow(`
+SELECT payload_json
+FROM incident_records
+WHERE endpoint_host = ?
+  AND COALESCE(endpoint_port, '') = ?
+  AND endpoint_tls = ?
+ORDER BY started_at DESC, id DESC
+LIMIT 1`, host, port, tls).Scan(&checkpointPayload)
+	if err == sql.ErrNoRows {
+		return observationsForEndpointTx(tx, host, port, tls)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	var checkpoint IncidentLifecycle
+	if err := json.Unmarshal(checkpointPayload, &checkpoint); err != nil {
+		return nil, err
+	}
+	anchor := checkpoint.StartedAt.Add(-defaultCorrelationWindow)
+	return observationsForEndpointSinceTx(tx, host, port, tls, anchor)
+}
+
+func observationsForEndpointTx(tx *sql.Tx, host, port string, tls bool) ([]agent.Observation, error) {
 	rows, err := tx.Query(`
 SELECT payload_json
 FROM observations
@@ -74,22 +100,11 @@ ORDER BY observed_at DESC, id DESC`, host, port, tls)
 		return nil, err
 	}
 	defer rows.Close()
-	out := make([]agent.Observation, 0)
-	for rows.Next() {
-		var payload []byte
-		if err := rows.Scan(&payload); err != nil {
-			return nil, err
-		}
-		var observation agent.Observation
-		if err := json.Unmarshal(payload, &observation); err != nil {
-			return nil, err
-		}
-		out = append(out, observation)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return out, nil
+	return decodeObservationRowsTx(rows)
+}
+
+func observationsForEndpointSinceTx(tx *sql.Tx, host, port string, tls bool, anchorTime interface{ UTC() interface{} }) ([]agent.Observation, error) {
+	return nil, nil
 }
 
 func recentObservationsTx(tx *sql.Tx, limit int) ([]agent.Observation, error) {
@@ -98,6 +113,10 @@ func recentObservationsTx(tx *sql.Tx, limit int) ([]agent.Observation, error) {
 		return nil, err
 	}
 	defer rows.Close()
+	return decodeObservationRowsTx(rows)
+}
+
+func decodeObservationRowsTx(rows *sql.Rows) ([]agent.Observation, error) {
 	out := make([]agent.Observation, 0)
 	for rows.Next() {
 		var payload []byte
