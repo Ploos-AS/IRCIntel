@@ -29,13 +29,32 @@ This behavior lets IRCIntel distinguish, for example, a network whose IPv4 endpo
 
 `Runner.RunEndpoint` represents one scheduled measurement of an IRC endpoint as two explicit family observations: IPv4 and IPv6. The parent runner performs the allowlist/denylist and rate-limit decision once for the endpoint, then the two family sub-probes run independently.
 
-A family failure is measurement data, not an endpoint-level execution error. Each family observation records `ok`, the probe result when available, and a human-readable error when that family fails. The aggregate endpoint result uses:
+A family failure is measurement data, not an endpoint-level execution error. Each family observation records `ok`, the probe result when available, a human-readable error, plus stable `error_code` and `error_stage` values when that family fails. The aggregate endpoint result uses:
 
 - `reachable=true` when at least one family succeeds.
 - `dual_stack_ok=true` only when both IPv4 and IPv6 succeed.
 - a stable measurement order: IPv4 first, IPv6 second.
 
 This means an endpoint can correctly be represented as IPv4 healthy / IPv6 failed without losing the successful IPv4 latency, TLS, server, and IRCv3 measurements.
+
+## Structured failure taxonomy
+
+Probe-stage failures use stable machine-readable codes instead of requiring consumers to parse human-readable error strings. Current codes include:
+
+- `invalid_config`
+- `dns_lookup_failed`
+- `no_ipv4_address`
+- `no_ipv6_address`
+- `no_address`
+- `tcp_connect_failed`
+- `tls_handshake_failed`
+- `irc_registration_write_failed`
+- `irc_pong_write_failed`
+- `irc_cap_end_write_failed`
+- `irc_read_failed`
+- `irc_registration_failed`
+
+Each classified error also carries a stable stage such as `config`, `dns`, `address_selection`, `tcp`, `tls`, or `irc_registration`. Human-readable error text remains available for diagnostics, but aggregation and incident detection should use the stable code/stage fields.
 
 ## Safety and privacy
 
@@ -50,6 +69,8 @@ M1 is qualified by deterministic local tests using synthetic IRC listeners. Prot
 Address-family qualification covers explicit IPv4 selection/dialing and an explicit IPv6 loopback registration probe when IPv6 loopback is available on the CI runner. Helper tests also verify family normalization, address selection and no-family-available failure behavior.
 
 Endpoint-model qualification covers mixed-family outcomes and verifies that one successful family keeps the endpoint reachable while `dual_stack_ok` remains false. It also verifies that the parent endpoint measurement consumes one host rate-limit slot.
+
+Failure-taxonomy qualification locks stable code/stage mappings for address-selection and TCP failures and verifies that endpoint family observations expose those fields.
 
 CI must continue to pass `go test ./...`, `go vet ./...`, the application build, and the M0.1 OCI runtime gate.
 
