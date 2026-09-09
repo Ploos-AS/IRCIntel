@@ -46,9 +46,22 @@ func (h IncidentLifecycleHandler) ServeHTTP(w http.ResponseWriter, r *http.Reque
 		limit = parsed
 	}
 
+	rawWindow := strings.TrimSpace(r.URL.Query().Get("window"))
+	if rawWindow == "" {
+		if records, ok := h.Reader.(IncidentRecordReader); ok {
+			lifecycles, err := records.ListIncidentRecords(limit)
+			if err != nil {
+				http.Error(w, "incident record query failed", http.StatusServiceUnavailable)
+				return
+			}
+			writeLifecycleEnvelope(w, lifecycles)
+			return
+		}
+	}
+
 	window := defaultCorrelationWindow
-	if raw := strings.TrimSpace(r.URL.Query().Get("window")); raw != "" {
-		parsed, err := time.ParseDuration(raw)
+	if rawWindow != "" {
+		parsed, err := time.ParseDuration(rawWindow)
 		if err != nil || parsed < minCorrelationWindow || parsed > maxCorrelationWindow {
 			http.Error(w, "invalid correlation window", http.StatusBadRequest)
 			return
@@ -67,7 +80,10 @@ func (h IncidentLifecycleHandler) ServeHTTP(w http.ResponseWriter, r *http.Reque
 	if len(lifecycles) > limit {
 		lifecycles = lifecycles[:limit]
 	}
+	writeLifecycleEnvelope(w, lifecycles)
+}
 
+func writeLifecycleEnvelope(w http.ResponseWriter, lifecycles []IncidentLifecycle) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(struct {
 		Incidents []IncidentLifecycle `json:"incidents"`
