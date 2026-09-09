@@ -15,7 +15,7 @@ import (
 )
 
 const observationTimeLayout = "2006-01-02T15:04:05.000000000Z"
-const sqliteSchemaVersion = 5
+const sqliteSchemaVersion = 6
 
 type SQLiteStore struct { db *sql.DB }
 
@@ -23,8 +23,6 @@ func OpenSQLiteStore(path string) (*SQLiteStore, error) {
 	if path == "" { return nil, errors.New("sqlite path is required") }
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil { return nil, err }
 	db, err := sql.Open("sqlite", path); if err != nil { return nil, err }
-	// SQLite PRAGMAs are connection-scoped. Keep this store on one database
-	// connection so foreign_keys=ON applies consistently to every operation.
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
 	if _, err := db.Exec(`PRAGMA foreign_keys = ON`); err != nil { _ = db.Close(); return nil, err }
@@ -42,9 +40,6 @@ func (s *SQLiteStore) migrate() error {
 	if err := s.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil { return err }
 	if version > sqliteSchemaVersion { return fmt.Errorf("sqlite schema version %d is newer than supported version %d", version, sqliteSchemaVersion) }
 
-	// Version 0 covers both a fresh database and every IRCIntel database created
-	// before explicit schema versioning. CREATE IF NOT EXISTS is intentionally
-	// retained so the same migration safely upgrades legacy installations.
 	if version == 0 {
 		if err := s.runMigration(1, func(tx *sql.Tx) error {
 			if _, err := tx.Exec(`
@@ -63,18 +58,11 @@ CREATE TABLE IF NOT EXISTS network_servers (id TEXT PRIMARY KEY, network_id TEXT
 CREATE INDEX IF NOT EXISTS idx_network_servers_network ON network_servers(network_id, name);
 CREATE TABLE IF NOT EXISTS network_endpoints (id TEXT PRIMARY KEY, server_id TEXT NOT NULL, host TEXT NOT NULL, port TEXT NOT NULL, tls INTEGER NOT NULL, FOREIGN KEY(server_id) REFERENCES network_servers(id), UNIQUE(server_id, host, port, tls));
 CREATE INDEX IF NOT EXISTS idx_network_endpoints_server ON network_endpoints(server_id, host, port);`); err != nil { return err }
-
-			// M2.12 historically normalized these columns on every process start. It is
-			// now a one-time v0 -> v1 data migration, inside the same transaction as
-			// the schema creation and version bump.
 			return normalizeLegacyTimesTx(tx)
 		}); err != nil { return err }
 		version = 1
 	}
 
-	// M3.15 moves discovery, review, and promotion storage into the canonical
-	// migration chain. Older deployments created these tables lazily on first use;
-	// IF NOT EXISTS preserves those installations without rewriting their data.
 	if version == 1 {
 		if err := s.runMigration(2, func(tx *sql.Tx) error {
 			_, err := tx.Exec(`
@@ -115,8 +103,6 @@ CREATE INDEX IF NOT EXISTS idx_discovery_promotions_time ON discovery_promotions
 		version = 2
 	}
 
-	// M3.20 makes agent retries idempotent. Before adding the unique observation
-	// identity index, collapse any historical duplicates and keep the newest row.
 	if version == 2 {
 		if err := s.runMigration(3, func(tx *sql.Tx) error {
 			_, err := tx.Exec(`
@@ -133,19 +119,21 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_observations_identity
 		version = 3
 	}
 
-	// M3.23 completes fixed-width UTC timestamp normalization for persisted
-	// network incidents. Older rows may contain variable-width RFC3339Nano values,
-	// which are unsafe for SQLite's lexical ordering and range filtering.
 	if version == 3 {
 		if err := s.runMigration(4, normalizeNetworkIncidentTimesTx); err != nil { return err }
 		version = 4
 	}
 
-	// M3.28 persists the latest reachability state for every agent+endpoint tuple.
-	// Existing databases are backfilled from their newest observation per tuple so
-	// the next milestone can derive transitions without replaying old observations.
 	if version == 4 {
 		if err := s.runMigration(5, migrateAgentEndpointStateTx); err != nil { return err }
+		version = 5
+	}
+
+	// M3.29 persists reachability transitions separately from raw observations.
+	// Existing databases are backfilled once so incident maintenance can switch to
+	// transition-event replay without losing historical lifecycle semantics.
+	if version == 5 {
+		if err := s.runMigration(6, migrateEndpointTransitionEventsTx); err != nil { return err }
 	}
 	return nil
 }
@@ -211,8 +199,11 @@ func (s *SQLiteStore) Store(observation agent.Observation) error {
 	tx,err:=s.db.Begin();if err!=nil{return err};defer tx.Rollback()
 	result,err:=tx.Exec(`INSERT OR IGNORE INTO observations (agent_id, observed_at, endpoint_host, endpoint_port, endpoint_tls, payload_json) VALUES (?, ?, ?, ?, ?, ?)`,observation.AgentID,formatObservationTime(observation.ObservedAt),observation.Endpoint.Host,observation.Endpoint.Port,observation.Endpoint.TLS,payload);if err!=nil{return err}
 	rows,err:=result.RowsAffected();if err!=nil{return err};if rows==0{return tx.Commit()}
-	if err:=refreshIncidentRecordsTx(tx);err!=nil{return err}
-	if err:=refreshNetworkIncidentRecordsTx(tx);err!=nil{return err}
+	transitioned,err:=persistTransitionForObservationTx(tx,observation);if err!=nil{return err}
+	if transitioned {
+		if err:=refreshIncidentRecordsTx(tx);err!=nil{return err}
+		if err:=refreshNetworkIncidentRecordsTx(tx);err!=nil{return err}
+	}
 	if err:=upsertAgentEndpointStateTx(tx,observation);err!=nil{return err}
 	return tx.Commit()
 }
