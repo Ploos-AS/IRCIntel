@@ -7,6 +7,9 @@ import (
 
 const (
 	CodeInvalidConfig          = "invalid_config"
+	CodeTargetDenied           = "target_denied"
+	CodeTargetNotAllowed       = "target_not_allowed"
+	CodeRateLimited            = "rate_limited"
 	CodeDNSLookupFailed        = "dns_lookup_failed"
 	CodeNoIPv4Address          = "no_ipv4_address"
 	CodeNoIPv6Address          = "no_ipv6_address"
