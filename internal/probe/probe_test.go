@@ -3,6 +3,9 @@ package probe
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"fmt"
 	"net"
 	"strings"
@@ -108,6 +111,41 @@ func TestRunRespondsToPINGDuringRegistration(t *testing.T) {
 
 	if _, err := testRunner(t, time.Millisecond).Run(context.Background(), Config{Host: "localhost", Port: port, Timeout: 2 * time.Second}); err != nil { t.Fatal(err) }
 	if err := <-done; err != nil { t.Fatal(err) }
+}
+
+func TestMetadataFromTLSState(t *testing.T) {
+	cert := &x509.Certificate{
+		Issuer:      pkix.Name{CommonName: "Example Test CA", Organization: []string{"Example Org"}},
+		Subject:     pkix.Name{CommonName: "irc.example.test"},
+		NotBefore:   time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC),
+		NotAfter:    time.Date(2027, 1, 2, 3, 4, 5, 0, time.UTC),
+		DNSNames:    []string{"irc.example.test", "*.example.test"},
+		IPAddresses: []net.IP{net.ParseIP("192.0.2.1"), net.ParseIP("2001:db8::1")},
+	}
+	metadata := metadataFromTLSState(tls.ConnectionState{
+		Version:          tls.VersionTLS13,
+		CipherSuite:      tls.TLS_AES_128_GCM_SHA256,
+		PeerCertificates: []*x509.Certificate{cert},
+	})
+	if metadata.Version != "TLS 1.3" { t.Fatalf("version=%q", metadata.Version) }
+	if metadata.CipherSuite != "TLS_AES_128_GCM_SHA256" { t.Fatalf("cipher=%q", metadata.CipherSuite) }
+	if metadata.Issuer == "" || !strings.Contains(metadata.Issuer, "Example Test CA") { t.Fatalf("issuer=%q", metadata.Issuer) }
+	if metadata.Subject != "CN=irc.example.test" { t.Fatalf("subject=%q", metadata.Subject) }
+	if metadata.NotBefore != "2026-01-02T03:04:05Z" { t.Fatalf("not_before=%q", metadata.NotBefore) }
+	if metadata.NotAfter != "2027-01-02T03:04:05Z" { t.Fatalf("not_after=%q", metadata.NotAfter) }
+	if fmt.Sprint(metadata.DNSNames) != fmt.Sprint([]string{"*.example.test", "irc.example.test"}) { t.Fatalf("dns_names=%v", metadata.DNSNames) }
+	if fmt.Sprint(metadata.IPAddresses) != fmt.Sprint([]string{"192.0.2.1", "2001:db8::1"}) { t.Fatalf("ip_addresses=%v", metadata.IPAddresses) }
+}
+
+func TestTLSVersionName(t *testing.T) {
+	cases := map[uint16]string{
+		tls.VersionTLS12: "TLS 1.2",
+		tls.VersionTLS13: "TLS 1.3",
+		0x9999:           "0x9999",
+	}
+	for version, want := range cases {
+		if got := tlsVersionName(version); got != want { t.Fatalf("version %04x: got %q want %q", version, got, want) }
+	}
 }
 
 func TestNewRunnerRequiresIdentityAndAllowlist(t *testing.T) {
