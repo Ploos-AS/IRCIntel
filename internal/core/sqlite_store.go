@@ -119,7 +119,6 @@ func (s *SQLiteStore) List(query ObservationQuery) ([]agent.Observation, error) 
 		return nil, err
 	}
 	defer rows.Close()
-
 	return decodeObservationRows(rows)
 }
 
@@ -138,6 +137,25 @@ FROM (
     FROM observations
 )
 WHERE row_number = 1`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return decodeObservationRows(rows)
+}
+
+func (s *SQLiteStore) RecentObservations(limit int) ([]agent.Observation, error) {
+	if s == nil || s.db == nil {
+		return nil, errors.New("sqlite store is not open")
+	}
+	if limit < 1 {
+		return nil, errors.New("invalid recent observation limit")
+	}
+	rows, err := s.db.Query(`
+SELECT payload_json
+FROM observations
+ORDER BY observed_at DESC, id DESC
+LIMIT ?`, limit)
 	if err != nil {
 		return nil, err
 	}
