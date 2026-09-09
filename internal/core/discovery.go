@@ -132,9 +132,35 @@ func discoveryCandidateID(input DiscoveryCandidateInput) string {
 	return "dc_" + hex.EncodeToString(sum[:12])
 }
 
-func (s *SQLiteStore) UpsertDiscoveryCandidate(input DiscoveryCandidateInput, observedAt time.Time) (DiscoveryCandidate, error) {
+func (s *SQLiteStore) ensureDiscoverySchema() error {
 	if s == nil || s.db == nil {
-		return DiscoveryCandidate{}, errors.New("sqlite store is not open")
+		return errors.New("sqlite store is not open")
+	}
+	_, err := s.db.Exec(`
+CREATE TABLE IF NOT EXISTS discovery_candidates (
+    id TEXT PRIMARY KEY,
+    host TEXT NOT NULL,
+    port TEXT NOT NULL,
+    tls INTEGER NOT NULL,
+    source TEXT NOT NULL,
+    source_ref TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'pending',
+    first_seen TEXT NOT NULL,
+    last_seen TEXT NOT NULL,
+    seen_count INTEGER NOT NULL DEFAULT 1,
+    CHECK(status IN ('pending','accepted','rejected'))
+);
+CREATE INDEX IF NOT EXISTS idx_discovery_candidates_status_seen
+    ON discovery_candidates(status, last_seen DESC);
+CREATE INDEX IF NOT EXISTS idx_discovery_candidates_endpoint
+    ON discovery_candidates(host, port, tls);
+`)
+	return err
+}
+
+func (s *SQLiteStore) UpsertDiscoveryCandidate(input DiscoveryCandidateInput, observedAt time.Time) (DiscoveryCandidate, error) {
+	if err := s.ensureDiscoverySchema(); err != nil {
+		return DiscoveryCandidate{}, err
 	}
 	input.Host = strings.ToLower(strings.TrimSpace(input.Host))
 	input.Port = strings.TrimSpace(input.Port)
@@ -186,8 +212,8 @@ FROM discovery_candidates WHERE id = ?`, id).Scan(
 }
 
 func (s *SQLiteStore) ListDiscoveryCandidates(status string) ([]DiscoveryCandidate, error) {
-	if s == nil || s.db == nil {
-		return nil, errors.New("sqlite store is not open")
+	if err := s.ensureDiscoverySchema(); err != nil {
+		return nil, err
 	}
 	status = strings.ToLower(strings.TrimSpace(status))
 	statement := `SELECT id, host, port, tls, source, source_ref, status, first_seen, last_seen, seen_count FROM discovery_candidates`
