@@ -1,10 +1,6 @@
 name: Live IRC probe qualification
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - .github/workflows/live-probe.yml
   workflow_dispatch:
     inputs:
       host:
@@ -23,21 +19,23 @@ jobs:
   qualify:
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    env:
-      TARGET_HOST: ${{ inputs.host || 'irc.libera.chat' }}
-      TARGET_PORT: ${{ inputs.port || '6697' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version: "1.24.x"
       - name: Validate approved target
+        env:
+          TARGET_HOST: ${{ inputs.host }}
         run: |
           case "$TARGET_HOST" in
             irc.libera.chat) ;;
             *) echo "Target is not approved for M1.2 qualification: $TARGET_HOST" >&2; exit 1 ;;
           esac
       - name: Run one TLS IRC qualification probe
+        env:
+          TARGET_HOST: ${{ inputs.host }}
+          TARGET_PORT: ${{ inputs.port }}
         run: |
           go run ./cmd/ircintel-probe \
             -host "$TARGET_HOST" \
