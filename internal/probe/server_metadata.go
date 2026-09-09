@@ -7,10 +7,10 @@ import (
 
 // ServerMetadata captures public metadata announced during IRC registration.
 type ServerMetadata struct {
-	Network        string            `json:"network,omitempty"`
-	Software       string            `json:"software,omitempty"`
-	SoftwareVersion string           `json:"software_version,omitempty"`
-	ISupport       map[string]string `json:"isupport,omitempty"`
+	Network         string            `json:"network,omitempty"`
+	Software        string            `json:"software,omitempty"`
+	SoftwareVersion string            `json:"software_version,omitempty"`
+	ISupport        map[string]string `json:"isupport,omitempty"`
 }
 
 func parseISupport(parts []string, metadata *ServerMetadata) {
@@ -40,12 +40,12 @@ func parseISupport(parts []string, metadata *ServerMetadata) {
 }
 
 func parseServerSoftware(parts []string, metadata *ServerMetadata) {
-	if len(parts) < 4 || parts[1] != "004" {
+	if len(parts) < 5 || parts[1] != "004" {
 		return
 	}
-	// RFC-style 004 is: <server> <version> <available user modes> <available channel modes>.
-	metadata.Software = parts[2]
-	metadata.SoftwareVersion = parts[3]
+	// Numeric 004 parameters are: <client> <server> <version> <available user modes> <available channel modes>.
+	metadata.Software = parts[3]
+	metadata.SoftwareVersion = parts[4]
 }
 
 func sortedISupportKeys(m map[string]string) []string {
