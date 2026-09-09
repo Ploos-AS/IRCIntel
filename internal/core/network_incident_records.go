@@ -3,10 +3,21 @@ package core
 import (
 	"encoding/json"
 	"errors"
+	"strings"
+	"time"
 )
 
+type NetworkIncidentRecordQuery struct {
+	Status    string
+	Severity  string
+	NetworkID string
+	Since     time.Time
+	Until     time.Time
+	Limit     int
+}
+
 type NetworkIncidentRecordReader interface {
-	ListNetworkIncidentRecords(limit int) ([]NetworkIncident, error)
+	ListNetworkIncidentRecords(query NetworkIncidentRecordQuery) ([]NetworkIncident, error)
 }
 
 func (s *SQLiteStore) refreshNetworkIncidentRecords() error {
@@ -28,12 +39,22 @@ status=excluded.status, severity=excluded.severity, payload_json=excluded.payloa
 	return tx.Commit()
 }
 
-func (s *SQLiteStore) ListNetworkIncidentRecords(limit int) ([]NetworkIncident, error) {
+func (s *SQLiteStore) ListNetworkIncidentRecords(query NetworkIncidentRecordQuery) ([]NetworkIncident, error) {
 	if s == nil || s.db == nil { return nil, errors.New("sqlite store is not open") }
-	if limit < 1 || limit > 500 { return nil, errors.New("invalid network incident limit") }
-	rows, err := s.db.Query(`SELECT payload_json FROM network_incident_records ORDER BY started_at DESC, id DESC LIMIT ?`, limit)
-	if err != nil { return nil, err }; defer rows.Close()
-	out := make([]NetworkIncident,0)
-	for rows.Next() { var payload []byte; if err:=rows.Scan(&payload); err!=nil{return nil,err}; var item NetworkIncident; if err:=json.Unmarshal(payload,&item);err!=nil{return nil,err}; out=append(out,item) }
-	if err:=rows.Err();err!=nil{return nil,err}; return out,nil
+	if query.Limit < 1 || query.Limit > 500 { return nil, errors.New("invalid network incident limit") }
+	if query.Status != "" && query.Status != "open" && query.Status != "closed" { return nil, errors.New("invalid network incident status") }
+	if query.Severity != "" && query.Severity != "degraded" && query.Severity != "down" { return nil, errors.New("invalid network incident severity") }
+	if !query.Since.IsZero() && !query.Until.IsZero() && query.Since.After(query.Until) { return nil, errors.New("invalid network incident time range") }
+	where := make([]string, 0, 5); args := make([]any, 0, 6)
+	if query.Status != "" { where=append(where,"status = ?"); args=append(args,query.Status) }
+	if query.Severity != "" { where=append(where,"severity = ?"); args=append(args,query.Severity) }
+	if query.NetworkID != "" { where=append(where,"network_id = ?"); args=append(args,query.NetworkID) }
+	if !query.Since.IsZero() { where=append(where,"started_at >= ?"); args=append(args,formatObservationTime(query.Since)) }
+	if !query.Until.IsZero() { where=append(where,"started_at <= ?"); args=append(args,formatObservationTime(query.Until)) }
+	statement := "SELECT payload_json FROM network_incident_records"
+	if len(where)>0 { statement += " WHERE " + strings.Join(where," AND ") }
+	statement += " ORDER BY started_at DESC, id DESC LIMIT ?"; args=append(args,query.Limit)
+	rows, err := s.db.Query(statement,args...); if err != nil { return nil,err }; defer rows.Close()
+	out:=make([]NetworkIncident,0); for rows.Next(){var payload []byte;if err:=rows.Scan(&payload);err!=nil{return nil,err};var item NetworkIncident;if err:=json.Unmarshal(payload,&item);err!=nil{return nil,err};out=append(out,item)}
+	if err:=rows.Err();err!=nil{return nil,err};return out,nil
 }
