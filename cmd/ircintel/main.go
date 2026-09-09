@@ -29,6 +29,7 @@ func main() {
 	status := core.StatusHandler{Token: token, Reader: store}
 	networkStatus := core.NetworkStatusHandler{Token: token, Reader: store}
 	networkIncidents := core.NetworkIncidentHandler{Token: token, Reader: store}
+	networkIncidentStats := core.NetworkIncidentStatsHandler{Token: token, Reader: store}
 	incidents := core.IncidentHandler{Token: token, Reader: store}
 	distributedIncidents := core.DistributedIncidentHandler{Token: token, Reader: store}
 	incidentLifecycle := core.IncidentLifecycleHandler{Token: token, Reader: store}
@@ -47,6 +48,7 @@ func main() {
 	mux.Handle("GET /api/v1/endpoints/status", status)
 	mux.Handle("GET /api/v1/networks/status", networkStatus)
 	mux.Handle("GET /api/v1/networks/incidents", networkIncidents)
+	mux.Handle("GET /api/v1/networks/incidents/stats", networkIncidentStats)
 	mux.Handle("GET /api/v1/incidents", incidents)
 	mux.Handle("GET /api/v1/incidents/distributed", distributedIncidents)
 	mux.Handle("GET /api/v1/incidents/lifecycle", incidentLifecycle)
