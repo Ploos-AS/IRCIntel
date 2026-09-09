@@ -15,6 +15,11 @@ import (
 func run(ctx context.Context) error {
 	cfg, err := agent.ConfigFromEnv()
 	if err != nil { return err }
+	if len(cfg.Endpoints) == 0 {
+		cfg.Endpoints, err = (agent.ProbePlanClient{CoreURL: cfg.CoreURL, Token: cfg.CoreToken}).Fetch(ctx, cfg.ID)
+		if err != nil { return err }
+		cfg.Policy = agent.PolicyForEndpoints(cfg.Endpoints, cfg.Interval)
+	}
 	runner, err := probe.NewRunner(cfg.Identity, cfg.Policy)
 	if err != nil { return err }
 
