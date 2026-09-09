@@ -71,20 +71,33 @@ func (r *Runner) Run(ctx context.Context, cfg Config) (Result, error) {
 	sort.Strings(ips)
 	result.ResolvedAddresses = ips
 
-	selected, err := selectAddress(ips, family)
-	if err != nil {
+	candidates := addressesForFamily(ips, family)
+	if len(candidates) == 0 {
 		code := CodeNoAddress
 		if family == "ipv4" { code = CodeNoIPv4Address }
 		if family == "ipv6" { code = CodeNoIPv6Address }
-		return result, probeError(code, "address_selection", err)
+		return result, probeError(code, "address_selection", fmt.Errorf("no %s address available", family))
 	}
-	result.SelectedAddress = selected
 
-	addr := net.JoinHostPort(selected, cfg.Port)
 	connectStart := time.Now()
-	conn, err := (&net.Dialer{}).DialContext(ctx, network, addr)
+	var conn net.Conn
+	var lastDialErr error
+	for _, selected := range candidates {
+		addr := net.JoinHostPort(selected, cfg.Port)
+		attempt, dialErr := (&net.Dialer{}).DialContext(ctx, network, addr)
+		if dialErr != nil {
+			lastDialErr = dialErr
+			continue
+		}
+		conn = attempt
+		result.SelectedAddress = selected
+		break
+	}
 	result.ConnectLatencyMS = time.Since(connectStart).Milliseconds()
-	if err != nil { return result, probeError(CodeTCPConnectFailed, "tcp", err) }
+	if conn == nil {
+		if lastDialErr == nil { lastDialErr = errors.New("all candidate addresses failed") }
+		return result, probeError(CodeTCPConnectFailed, "tcp", lastDialErr)
+	}
 	defer conn.Close()
 
 	if cfg.TLS {
@@ -167,20 +180,27 @@ func normalizeFamily(family string) (string, string, error) {
 	}
 }
 
-func selectAddress(addresses []string, family string) (string, error) {
+func addressesForFamily(addresses []string, family string) []string {
+	selected := make([]string, 0, len(addresses))
 	for _, address := range addresses {
 		ip := net.ParseIP(address)
 		if ip == nil { continue }
 		switch family {
 		case "any":
-			return address, nil
+			selected = append(selected, address)
 		case "ipv4":
-			if ip.To4() != nil { return address, nil }
+			if ip.To4() != nil { selected = append(selected, address) }
 		case "ipv6":
-			if ip.To4() == nil { return address, nil }
+			if ip.To4() == nil { selected = append(selected, address) }
 		}
 	}
-	return "", fmt.Errorf("no %s address available", family)
+	return selected
+}
+
+func selectAddress(addresses []string, family string) (string, error) {
+	selected := addressesForFamily(addresses, family)
+	if len(selected) == 0 { return "", fmt.Errorf("no %s address available", family) }
+	return selected[0], nil
 }
 
 func metadataFromTLSState(state tls.ConnectionState) TLSMetadata {
