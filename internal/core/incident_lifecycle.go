@@ -36,20 +36,15 @@ func (h IncidentLifecycleHandler) ServeHTTP(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	limit := defaultIncidentLimit
-	if raw := r.URL.Query().Get("limit"); raw != "" {
-		parsed, err := strconv.Atoi(raw)
-		if err != nil || parsed < 1 || parsed > maxIncidentLimit {
-			http.Error(w, "invalid limit", http.StatusBadRequest)
-			return
-		}
-		limit = parsed
+	query, ok := parseIncidentRecordQuery(w, r)
+	if !ok {
+		return
 	}
 
 	rawWindow := strings.TrimSpace(r.URL.Query().Get("window"))
 	if rawWindow == "" {
 		if records, ok := h.Reader.(IncidentRecordReader); ok {
-			lifecycles, err := records.ListIncidentRecords(limit)
+			lifecycles, err := records.ListIncidentRecords(query)
 			if err != nil {
 				http.Error(w, "incident record query failed", http.StatusServiceUnavailable)
 				return
@@ -76,11 +71,71 @@ func (h IncidentLifecycleHandler) ServeHTTP(w http.ResponseWriter, r *http.Reque
 	}
 	events := deriveIncidentEvents(observations)
 	correlated := correlateIncidentEvents(events, window)
-	lifecycles := pairIncidentLifecycle(correlated)
-	if len(lifecycles) > limit {
-		lifecycles = lifecycles[:limit]
+	lifecycles := filterIncidentLifecycles(pairIncidentLifecycle(correlated), query)
+	if len(lifecycles) > query.Limit {
+		lifecycles = lifecycles[:query.Limit]
 	}
 	writeLifecycleEnvelope(w, lifecycles)
+}
+
+func parseIncidentRecordQuery(w http.ResponseWriter, r *http.Request) (IncidentRecordQuery, bool) {
+	query := IncidentRecordQuery{Limit: defaultIncidentLimit}
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed < 1 || parsed > maxIncidentLimit {
+			http.Error(w, "invalid limit", http.StatusBadRequest)
+			return IncidentRecordQuery{}, false
+		}
+		query.Limit = parsed
+	}
+	query.Status = strings.TrimSpace(r.URL.Query().Get("status"))
+	if query.Status != "" && query.Status != "open" && query.Status != "closed" {
+		http.Error(w, "invalid status", http.StatusBadRequest)
+		return IncidentRecordQuery{}, false
+	}
+	query.Host = strings.TrimSpace(r.URL.Query().Get("host"))
+	var err error
+	if raw := strings.TrimSpace(r.URL.Query().Get("since")); raw != "" {
+		query.Since, err = time.Parse(time.RFC3339Nano, raw)
+		if err != nil {
+			http.Error(w, "invalid since", http.StatusBadRequest)
+			return IncidentRecordQuery{}, false
+		}
+		query.Since = query.Since.UTC()
+	}
+	if raw := strings.TrimSpace(r.URL.Query().Get("until")); raw != "" {
+		query.Until, err = time.Parse(time.RFC3339Nano, raw)
+		if err != nil {
+			http.Error(w, "invalid until", http.StatusBadRequest)
+			return IncidentRecordQuery{}, false
+		}
+		query.Until = query.Until.UTC()
+	}
+	if !query.Since.IsZero() && !query.Until.IsZero() && query.Since.After(query.Until) {
+		http.Error(w, "invalid time range", http.StatusBadRequest)
+		return IncidentRecordQuery{}, false
+	}
+	return query, true
+}
+
+func filterIncidentLifecycles(items []IncidentLifecycle, query IncidentRecordQuery) []IncidentLifecycle {
+	filtered := make([]IncidentLifecycle, 0, len(items))
+	for _, item := range items {
+		if query.Status != "" && item.Status != query.Status {
+			continue
+		}
+		if query.Host != "" && item.Host != query.Host {
+			continue
+		}
+		if !query.Since.IsZero() && item.StartedAt.Before(query.Since) {
+			continue
+		}
+		if !query.Until.IsZero() && item.StartedAt.After(query.Until) {
+			continue
+		}
+		filtered = append(filtered, item)
+	}
+	return filtered
 }
 
 func writeLifecycleEnvelope(w http.ResponseWriter, lifecycles []IncidentLifecycle) {
@@ -123,8 +178,7 @@ func pairIncidentLifecycle(incidents []DistributedIncident) []IncidentLifecycle 
 				continue
 			}
 			recoveredAt := incident.LastEventAt
-			duration := recoveredAt.Sub(lifecycles[index].StartedAt).Seconds()
-			durationSeconds := int64(duration)
+			durationSeconds := int64(recoveredAt.Sub(lifecycles[index].StartedAt).Seconds())
 			lifecycles[index].Status = "closed"
 			lifecycles[index].RecoveredAt = &recoveredAt
 			lifecycles[index].DurationSeconds = &durationSeconds
