@@ -15,7 +15,7 @@ import (
 )
 
 const observationTimeLayout = "2006-01-02T15:04:05.000000000Z"
-const sqliteSchemaVersion = 2
+const sqliteSchemaVersion = 3
 
 type SQLiteStore struct { db *sql.DB }
 
@@ -108,6 +108,26 @@ CREATE TABLE IF NOT EXISTS discovery_promotions (
 );
 CREATE INDEX IF NOT EXISTS idx_discovery_promotions_time ON discovery_promotions(promoted_at DESC);`); err != nil { return err }
 		if _, err := s.db.Exec(`PRAGMA user_version = 2`); err != nil { return err }
+		version = 2
+	}
+
+	// M3.20 makes agent retries idempotent. Before adding the unique observation
+	// identity index, collapse any historical duplicates and keep the newest row.
+	if version == 2 {
+		tx, err := s.db.Begin()
+		if err != nil { return err }
+		defer tx.Rollback()
+		if _, err := tx.Exec(`
+DELETE FROM observations
+WHERE id NOT IN (
+    SELECT MAX(id)
+    FROM observations
+    GROUP BY agent_id, observed_at, endpoint_host, COALESCE(endpoint_port, ''), endpoint_tls
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_observations_identity
+    ON observations(agent_id, observed_at, endpoint_host, COALESCE(endpoint_port, ''), endpoint_tls);`); err != nil { return err }
+		if _, err := tx.Exec(`PRAGMA user_version = 3`); err != nil { return err }
+		if err := tx.Commit(); err != nil { return err }
 	}
 	return nil
 }
@@ -130,7 +150,8 @@ func (s *SQLiteStore) normalizeLegacyTimes() error {
 
 func (s *SQLiteStore) Store(observation agent.Observation) error {
 	if s==nil||s.db==nil{return errors.New("sqlite store is not open")};payload,err:=json.Marshal(observation);if err!=nil{return err}
-	_,err=s.db.Exec(`INSERT INTO observations (agent_id, observed_at, endpoint_host, endpoint_port, endpoint_tls, payload_json) VALUES (?, ?, ?, ?, ?, ?)`,observation.AgentID,formatObservationTime(observation.ObservedAt),observation.Endpoint.Host,observation.Endpoint.Port,observation.Endpoint.TLS,payload);if err!=nil{return err}
+	result,err:=s.db.Exec(`INSERT OR IGNORE INTO observations (agent_id, observed_at, endpoint_host, endpoint_port, endpoint_tls, payload_json) VALUES (?, ?, ?, ?, ?, ?)`,observation.AgentID,formatObservationTime(observation.ObservedAt),observation.Endpoint.Host,observation.Endpoint.Port,observation.Endpoint.TLS,payload);if err!=nil{return err}
+	rows,err:=result.RowsAffected();if err!=nil{return err};if rows==0{return nil}
 	if err:=s.refreshIncidentRecords();err!=nil{return err};return s.refreshNetworkIncidentRecords()
 }
 
