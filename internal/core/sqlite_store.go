@@ -15,7 +15,7 @@ import (
 )
 
 const observationTimeLayout = "2006-01-02T15:04:05.000000000Z"
-const sqliteSchemaVersion = 1
+const sqliteSchemaVersion = 2
 
 type SQLiteStore struct { db *sql.DB }
 
@@ -58,7 +58,48 @@ CREATE INDEX IF NOT EXISTS idx_network_endpoints_server ON network_endpoints(ser
 		// M2.12 historically normalized these columns on every process start. It is
 		// now a one-time v0 -> v1 data migration, eliminating an O(N) startup scan.
 		if err := s.normalizeLegacyTimes(); err != nil { return err }
-		if _, err := s.db.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, sqliteSchemaVersion)); err != nil { return err }
+		if _, err := s.db.Exec(`PRAGMA user_version = 1`); err != nil { return err }
+		version = 1
+	}
+
+	// M3.15 moves discovery, review, and promotion storage into the canonical
+	// migration chain. Older deployments created these tables lazily on first use;
+	// IF NOT EXISTS preserves those installations without rewriting their data.
+	if version == 1 {
+		if _, err := s.db.Exec(`
+CREATE TABLE IF NOT EXISTS discovery_candidates (
+    id TEXT PRIMARY KEY,
+    host TEXT NOT NULL,
+    port TEXT NOT NULL,
+    tls INTEGER NOT NULL,
+    source TEXT NOT NULL,
+    source_ref TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'pending',
+    first_seen TEXT NOT NULL,
+    last_seen TEXT NOT NULL,
+    seen_count INTEGER NOT NULL DEFAULT 1,
+    CHECK(status IN ('pending','accepted','rejected'))
+);
+CREATE INDEX IF NOT EXISTS idx_discovery_candidates_status_seen ON discovery_candidates(status, last_seen DESC);
+CREATE INDEX IF NOT EXISTS idx_discovery_candidates_endpoint ON discovery_candidates(host, port, tls);
+CREATE TABLE IF NOT EXISTS discovery_reviews (
+    candidate_id TEXT PRIMARY KEY,
+    status TEXT NOT NULL,
+    reviewer TEXT NOT NULL,
+    note TEXT NOT NULL DEFAULT '',
+    reviewed_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_discovery_reviews_time ON discovery_reviews(reviewed_at DESC);
+CREATE TABLE IF NOT EXISTS discovery_promotions (
+    candidate_id TEXT PRIMARY KEY,
+    endpoint_id TEXT NOT NULL,
+    server_id TEXT NOT NULL,
+    promoter TEXT NOT NULL,
+    note TEXT NOT NULL DEFAULT '',
+    promoted_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_discovery_promotions_time ON discovery_promotions(promoted_at DESC);`); err != nil { return err }
+		if _, err := s.db.Exec(`PRAGMA user_version = 2`); err != nil { return err }
 	}
 	return nil
 }
