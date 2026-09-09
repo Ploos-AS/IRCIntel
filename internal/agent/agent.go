@@ -2,7 +2,6 @@ package agent
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"io"
 	"time"
@@ -32,6 +31,7 @@ type Agent struct {
 	Interval  time.Duration
 	Endpoints []Endpoint
 	Runner    EndpointRunner
+	Submitter Submitter
 	Output    io.Writer
 	Now       func() time.Time
 }
@@ -39,11 +39,15 @@ type Agent struct {
 func (a *Agent) RunOnce(ctx context.Context) error {
 	if a.ID == "" { return errors.New("agent id is required") }
 	if a.Runner == nil { return errors.New("agent runner is required") }
-	if a.Output == nil { return errors.New("agent output is required") }
 	if len(a.Endpoints) == 0 { return errors.New("at least one endpoint is required") }
 	if a.Now == nil { a.Now = time.Now }
 
-	encoder := json.NewEncoder(a.Output)
+	submitter := a.Submitter
+	if submitter == nil {
+		if a.Output == nil { return errors.New("agent submitter is required") }
+		submitter = WriterSubmitter{Writer: a.Output}
+	}
+
 	for _, endpoint := range a.Endpoints {
 		result, err := a.Runner.RunEndpoint(ctx, probe.Config{Host: endpoint.Host, Port: endpoint.Port, TLS: endpoint.TLS})
 		if err != nil { return err }
@@ -53,7 +57,7 @@ func (a *Agent) RunOnce(ctx context.Context) error {
 			Endpoint:   endpoint,
 			Result:     result,
 		}
-		if err := encoder.Encode(observation); err != nil { return err }
+		if err := submitter.Submit(ctx, observation); err != nil { return err }
 	}
 	return nil
 }
