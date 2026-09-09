@@ -3,6 +3,7 @@ package core
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -66,14 +67,38 @@ func TestRegistryWriteRejectsUnknownFields(t *testing.T) {
 	}
 }
 
-func TestRegistryWriteServerReportsMissingParent(t *testing.T) {
-	writer := &fakeRegistryWriter{err: errors.New("network does not exist")}
+func TestRegistryWriteServerReportsMissingParentFromTypedError(t *testing.T) {
+	writer := &fakeRegistryWriter{err: fmt.Errorf("wrapped: %w", ErrRegistryNetworkNotFound)}
 	h := RegistryWriteHandler{Token: "secret", Writer: writer}
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/registry/servers", bytes.NewBufferString(`{"id":"server-1","network_id":"missing","name":"irc.example"}`))
 	req.Header.Set("Authorization", "Bearer secret")
 	res := httptest.NewRecorder()
 	h.Server(res, req)
 	if res.Code != http.StatusConflict {
+		t.Fatalf("status=%d body=%q", res.Code, res.Body.String())
+	}
+}
+
+func TestRegistryWriteEndpointReportsMissingParentFromTypedError(t *testing.T) {
+	writer := &fakeRegistryWriter{err: fmt.Errorf("wrapped: %w", ErrRegistryServerNotFound)}
+	h := RegistryWriteHandler{Token: "secret", Writer: writer}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/registry/endpoints", bytes.NewBufferString(`{"id":"endpoint-1","server_id":"missing","host":"irc.example","port":"6697","tls":true}`))
+	req.Header.Set("Authorization", "Bearer secret")
+	res := httptest.NewRecorder()
+	h.Endpoint(res, req)
+	if res.Code != http.StatusConflict {
+		t.Fatalf("status=%d body=%q", res.Code, res.Body.String())
+	}
+}
+
+func TestRegistryWriteDoesNotClassifyErrorTextAsMissingParent(t *testing.T) {
+	writer := &fakeRegistryWriter{err: errors.New("network does not exist")}
+	h := RegistryWriteHandler{Token: "secret", Writer: writer}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/registry/servers", bytes.NewBufferString(`{"id":"server-1","network_id":"n1","name":"irc.example"}`))
+	req.Header.Set("Authorization", "Bearer secret")
+	res := httptest.NewRecorder()
+	h.Server(res, req)
+	if res.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status=%d body=%q", res.Code, res.Body.String())
 	}
 }
