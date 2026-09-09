@@ -36,9 +36,15 @@ func TestSQLiteStoreListsNewestAndFilters(t *testing.T) {
 	got, err = store.List(ObservationQuery{Host: "irc.one", Limit: 1})
 	if err != nil { t.Fatal(err) }
 	if len(got) != 1 || got[0].AgentID != "ams-1" { t.Fatalf("unexpected host result: %+v", got) }
+
+	got, err = store.List(ObservationQuery{Since: base.Add(time.Minute), Until: base.Add(2 * time.Minute), Limit: 10})
+	if err != nil { t.Fatal(err) }
+	if len(got) != 2 || got[0].Endpoint.Host != "irc.two" || got[1].AgentID != "ams-1" {
+		t.Fatalf("unexpected time range: %+v", got)
+	}
 }
 
-func TestReadHandlerValidatesLimitAndAuthentication(t *testing.T) {
+func TestReadHandlerValidatesLimitAuthenticationAndTime(t *testing.T) {
 	store, err := OpenSQLiteStore(filepath.Join(t.TempDir(), "ircintel.db"))
 	if err != nil { t.Fatal(err) }
 	defer store.Close()
@@ -48,11 +54,19 @@ func TestReadHandlerValidatesLimitAndAuthentication(t *testing.T) {
 	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/v1/observations?limit=0", nil))
 	if response.Code != http.StatusUnauthorized { t.Fatalf("unauthorized status=%d", response.Code) }
 
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/observations?limit=501", nil)
-	req.Header.Set("Authorization", "Bearer secret")
-	response = httptest.NewRecorder()
-	handler.ServeHTTP(response, req)
-	if response.Code != http.StatusBadRequest { t.Fatalf("invalid limit status=%d", response.Code) }
+	cases := []string{
+		"/api/v1/observations?limit=501",
+		"/api/v1/observations?since=not-a-time",
+		"/api/v1/observations?until=not-a-time",
+		"/api/v1/observations?since=2026-09-09T04:00:00Z&until=2026-09-09T03:00:00Z",
+	}
+	for _, target := range cases {
+		req := httptest.NewRequest(http.MethodGet, target, nil)
+		req.Header.Set("Authorization", "Bearer secret")
+		response = httptest.NewRecorder()
+		handler.ServeHTTP(response, req)
+		if response.Code != http.StatusBadRequest { t.Fatalf("target=%s status=%d", target, response.Code) }
+	}
 }
 
 func TestReadHandlerReturnsEnvelope(t *testing.T) {
