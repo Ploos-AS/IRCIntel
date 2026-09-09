@@ -19,6 +19,7 @@ type Config struct {
 	TLS        bool
 	ServerName string
 	Timeout    time.Duration
+	Family     string
 }
 
 type TLSMetadata struct {
@@ -36,6 +37,8 @@ type Result struct {
 	Host              string       `json:"host"`
 	Port              string       `json:"port"`
 	TLS               bool         `json:"tls"`
+	AddressFamily     string       `json:"address_family,omitempty"`
+	SelectedAddress   string       `json:"selected_address,omitempty"`
 	ResolvedAddresses []string     `json:"resolved_addresses,omitempty"`
 	DNSLatencyMS      int64        `json:"dns_latency_ms"`
 	ConnectLatencyMS  int64        `json:"connect_latency_ms"`
@@ -53,10 +56,12 @@ func (r *Runner) Run(ctx context.Context, cfg Config) (Result, error) {
 		if cfg.TLS { cfg.Port = "6697" } else { cfg.Port = "6667" }
 	}
 	if cfg.Timeout <= 0 { cfg.Timeout = 10 * time.Second }
+	family, network, err := normalizeFamily(cfg.Family)
+	if err != nil { return Result{Host: cfg.Host, Port: cfg.Port, TLS: cfg.TLS}, err }
 
 	ctx, cancel := context.WithTimeout(ctx, cfg.Timeout)
 	defer cancel()
-	result := Result{Host: cfg.Host, Port: cfg.Port, TLS: cfg.TLS}
+	result := Result{Host: cfg.Host, Port: cfg.Port, TLS: cfg.TLS, AddressFamily: family}
 
 	dnsStart := time.Now()
 	ips, err := net.DefaultResolver.LookupHost(ctx, cfg.Host)
@@ -65,9 +70,13 @@ func (r *Runner) Run(ctx context.Context, cfg Config) (Result, error) {
 	sort.Strings(ips)
 	result.ResolvedAddresses = ips
 
-	addr := net.JoinHostPort(cfg.Host, cfg.Port)
+	selected, err := selectAddress(ips, family)
+	if err != nil { return result, err }
+	result.SelectedAddress = selected
+
+	addr := net.JoinHostPort(selected, cfg.Port)
 	connectStart := time.Now()
-	conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", addr)
+	conn, err := (&net.Dialer{}).DialContext(ctx, network, addr)
 	result.ConnectLatencyMS = time.Since(connectStart).Milliseconds()
 	if err != nil { return result, fmt.Errorf("tcp connect: %w", err) }
 	defer conn.Close()
@@ -131,6 +140,35 @@ func (r *Runner) Run(ctx context.Context, cfg Config) (Result, error) {
 	}
 	if err := scanner.Err(); err != nil { return result, fmt.Errorf("irc read: %w", err) }
 	return result, errors.New("connection closed before IRC registration completed")
+}
+
+func normalizeFamily(family string) (string, string, error) {
+	switch strings.ToLower(strings.TrimSpace(family)) {
+	case "", "any", "auto":
+		return "any", "tcp", nil
+	case "4", "ipv4", "tcp4":
+		return "ipv4", "tcp4", nil
+	case "6", "ipv6", "tcp6":
+		return "ipv6", "tcp6", nil
+	default:
+		return "", "", fmt.Errorf("unsupported address family %q", family)
+	}
+}
+
+func selectAddress(addresses []string, family string) (string, error) {
+	for _, address := range addresses {
+		ip := net.ParseIP(address)
+		if ip == nil { continue }
+		switch family {
+		case "any":
+			return address, nil
+		case "ipv4":
+			if ip.To4() != nil { return address, nil }
+		case "ipv6":
+			if ip.To4() == nil { return address, nil }
+		}
+	}
+	return "", fmt.Errorf("no %s address available", family)
 }
 
 func metadataFromTLSState(state tls.ConnectionState) TLSMetadata {
