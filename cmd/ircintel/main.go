@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"os"
 	"time"
+
+	"github.com/Ploos-AS/IRCIntel/internal/core"
 )
 
 var version = "dev"
@@ -17,6 +19,8 @@ type versionResponse struct {
 
 func main() {
 	listen := getenv("IRCINTEL_LISTEN", ":8080")
+	store := &core.MemoryStore{}
+	ingest := core.IngestHandler{Token: os.Getenv("IRCINTEL_CORE_TOKEN"), Store: store}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
@@ -28,6 +32,7 @@ func main() {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(versionResponse{Name: "IRCIntel", Version: version})
 	})
+	mux.Handle("POST /api/v1/observations", ingest)
 
 	srv := &http.Server{
 		Addr:              listen,
