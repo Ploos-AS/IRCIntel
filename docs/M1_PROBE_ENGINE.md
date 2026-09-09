@@ -25,6 +25,18 @@ The structured result records all resolved addresses, the selected address, the 
 
 This behavior lets IRCIntel distinguish, for example, a network whose IPv4 endpoint is healthy while IPv6 is unreachable or materially slower.
 
+## Endpoint measurement model
+
+`Runner.RunEndpoint` represents one scheduled measurement of an IRC endpoint as two explicit family observations: IPv4 and IPv6. The parent runner performs the allowlist/denylist and rate-limit decision once for the endpoint, then the two family sub-probes run independently.
+
+A family failure is measurement data, not an endpoint-level execution error. Each family observation records `ok`, the probe result when available, and a human-readable error when that family fails. The aggregate endpoint result uses:
+
+- `reachable=true` when at least one family succeeds.
+- `dual_stack_ok=true` only when both IPv4 and IPv6 succeed.
+- a stable measurement order: IPv4 first, IPv6 second.
+
+This means an endpoint can correctly be represented as IPv4 healthy / IPv6 failed without losing the successful IPv4 latency, TLS, server, and IRCv3 measurements.
+
 ## Safety and privacy
 
 The M1 probe does not join channels and does not collect `PRIVMSG`, `NOTICE`, channel messages, user histories or credentials. It performs only the minimum protocol exchange needed to measure a public IRC endpoint.
@@ -36,6 +48,8 @@ TLS metadata is limited to information already presented by the public endpoint 
 M1 is qualified by deterministic local tests using synthetic IRC listeners. Protocol regression tests require correct CAP negotiation, multiline CAP handling and PING/PONG behavior. TLS metadata extraction is separately tested from a deterministic connection state/certificate fixture.
 
 Address-family qualification covers explicit IPv4 selection/dialing and an explicit IPv6 loopback registration probe when IPv6 loopback is available on the CI runner. Helper tests also verify family normalization, address selection and no-family-available failure behavior.
+
+Endpoint-model qualification covers mixed-family outcomes and verifies that one successful family keeps the endpoint reachable while `dual_stack_ok` remains false. It also verifies that the parent endpoint measurement consumes one host rate-limit slot.
 
 CI must continue to pass `go test ./...`, `go vet ./...`, the application build, and the M0.1 OCI runtime gate.
 
