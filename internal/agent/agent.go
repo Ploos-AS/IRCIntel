@@ -20,6 +20,9 @@ type Observation struct {
 	ObservedAt time.Time            `json:"observed_at"`
 	Endpoint   Endpoint             `json:"endpoint"`
 	Result     probe.EndpointResult `json:"result"`
+	Error      string               `json:"error,omitempty"`
+	ErrorCode  string               `json:"error_code,omitempty"`
+	ErrorStage string               `json:"error_stage,omitempty"`
 }
 
 type EndpointRunner interface {
@@ -49,13 +52,16 @@ func (a *Agent) RunOnce(ctx context.Context) error {
 	}
 
 	for _, endpoint := range a.Endpoints {
-		result, err := a.Runner.RunEndpoint(ctx, probe.Config{Host: endpoint.Host, Port: endpoint.Port, TLS: endpoint.TLS})
-		if err != nil { return err }
+		result, probeErr := a.Runner.RunEndpoint(ctx, probe.Config{Host: endpoint.Host, Port: endpoint.Port, TLS: endpoint.TLS})
 		observation := Observation{
 			AgentID:    a.ID,
 			ObservedAt: a.Now().UTC(),
 			Endpoint:   endpoint,
 			Result:     result,
+		}
+		if probeErr != nil {
+			observation.Error = probeErr.Error()
+			observation.ErrorCode, observation.ErrorStage = probe.ErrorInfo(probeErr)
 		}
 		if err := submitter.Submit(ctx, observation); err != nil { return err }
 	}
