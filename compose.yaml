@@ -6,6 +6,7 @@ services:
     environment:
       IRCINTEL_LISTEN: ":8080"
       IRCINTEL_DB_PATH: "/data/ircintel.db"
+      IRCINTEL_STATUS_FRESHNESS: "15m"
     ports:
       - "8080:8080"
     volumes:
