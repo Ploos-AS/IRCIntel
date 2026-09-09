@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Ploos-AS/IRCIntel/internal/agent"
 )
@@ -17,6 +18,8 @@ const (
 type ObservationQuery struct {
 	AgentID string
 	Host    string
+	Since   time.Time
+	Until   time.Time
 	Limit   int
 }
 
@@ -49,9 +52,26 @@ func (h ReadHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		limit = parsed
 	}
 
+	since, err := parseObservationTime(r.URL.Query().Get("since"))
+	if err != nil {
+		http.Error(w, "invalid since", http.StatusBadRequest)
+		return
+	}
+	until, err := parseObservationTime(r.URL.Query().Get("until"))
+	if err != nil {
+		http.Error(w, "invalid until", http.StatusBadRequest)
+		return
+	}
+	if !since.IsZero() && !until.IsZero() && since.After(until) {
+		http.Error(w, "invalid time range", http.StatusBadRequest)
+		return
+	}
+
 	observations, err := h.Reader.List(ObservationQuery{
 		AgentID: strings.TrimSpace(r.URL.Query().Get("agent_id")),
 		Host:    strings.TrimSpace(r.URL.Query().Get("host")),
+		Since:   since,
+		Until:   until,
 		Limit:   limit,
 	})
 	if err != nil {
@@ -63,4 +83,15 @@ func (h ReadHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(struct {
 		Observations []agent.Observation `json:"observations"`
 	}{Observations: observations})
+}
+
+func parseObservationTime(raw string) (time.Time, error) {
+	if strings.TrimSpace(raw) == "" {
+		return time.Time{}, nil
+	}
+	value, err := time.Parse(time.RFC3339Nano, raw)
+	if err != nil {
+		return time.Time{}, err
+	}
+	return value.UTC(), nil
 }
