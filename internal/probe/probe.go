@@ -96,11 +96,11 @@ func (r *Runner) Run(ctx context.Context, cfg Config) (Result, error) {
 			continue
 		}
 
-		if isCAPLS(parts) {
+		if capIdx, ok := capLSIndex(parts); ok {
 			if idx := strings.Index(line, " :"); idx >= 0 {
 				for _, capability := range strings.Fields(line[idx+2:]) { caps[capability] = struct{}{} }
 			}
-			if !capLSContinues(parts) && !capEnded {
+			if !capLSContinues(parts, capIdx) && !capEnded {
 				if _, err := fmt.Fprint(conn, "CAP END\r\n"); err != nil { return result, fmt.Errorf("irc cap end write: %w", err) }
 				capEnded = true
 			}
@@ -118,18 +118,13 @@ func (r *Runner) Run(ctx context.Context, cfg Config) (Result, error) {
 	return result, errors.New("connection closed before IRC registration completed")
 }
 
-func isCAPLS(parts []string) bool {
-	for i := 0; i+1 < len(parts); i++ {
-		if strings.EqualFold(parts[i], "CAP") && strings.EqualFold(parts[i+1], "LS") { return true }
+func capLSIndex(parts []string) (int, bool) {
+	for i := 0; i+2 < len(parts); i++ {
+		if strings.EqualFold(parts[i], "CAP") && strings.EqualFold(parts[i+2], "LS") { return i, true }
 	}
-	return false
+	return 0, false
 }
 
-func capLSContinues(parts []string) bool {
-	for i := 0; i+2 < len(parts); i++ {
-		if strings.EqualFold(parts[i], "CAP") && strings.EqualFold(parts[i+1], "LS") {
-			return parts[i+2] == "*"
-		}
-	}
-	return false
+func capLSContinues(parts []string, capIdx int) bool {
+	return capIdx+3 < len(parts) && parts[capIdx+3] == "*"
 }
