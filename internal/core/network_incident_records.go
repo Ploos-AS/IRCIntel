@@ -23,7 +23,7 @@ type NetworkIncidentRecordReader interface {
 func (s *SQLiteStore) refreshNetworkIncidentRecords() error {
 	if s == nil || s.db == nil { return errors.New("sqlite store is not open") }
 	snapshot, err := s.RegistrySnapshot(); if err != nil { return err }
-	endpoints, err := s.ListIncidentRecords(IncidentRecordQuery{Limit: 500}); if err != nil { return err }
+	endpoints, err := s.listAllIncidentRecords(); if err != nil { return err }
 	items := deriveNetworkIncidents(snapshot, endpoints)
 	if len(items) == 0 { return nil }
 	tx, err := s.db.Begin(); if err != nil { return err }; defer tx.Rollback()
@@ -37,6 +37,27 @@ status=excluded.status, severity=excluded.severity, payload_json=excluded.payloa
 		if err != nil { return err }
 	}
 	return tx.Commit()
+}
+
+// listAllIncidentRecords is the canonical derivation path for persisted network
+// incidents. It intentionally has no public API limit: truncating endpoint incident
+// history can silently lose older network incidents or their recovery transitions.
+// User-facing ListIncidentRecords remains bounded independently.
+func (s *SQLiteStore) listAllIncidentRecords() ([]IncidentLifecycle, error) {
+	if s == nil || s.db == nil { return nil, errors.New("sqlite store is not open") }
+	rows, err := s.db.Query("SELECT payload_json FROM incident_records ORDER BY started_at DESC, id DESC")
+	if err != nil { return nil, err }
+	defer rows.Close()
+	out := make([]IncidentLifecycle, 0)
+	for rows.Next() {
+		var payload []byte
+		if err := rows.Scan(&payload); err != nil { return nil, err }
+		var item IncidentLifecycle
+		if err := json.Unmarshal(payload, &item); err != nil { return nil, err }
+		out = append(out, item)
+	}
+	if err := rows.Err(); err != nil { return nil, err }
+	return out, nil
 }
 
 func (s *SQLiteStore) ListNetworkIncidentRecords(query NetworkIncidentRecordQuery) ([]NetworkIncident, error) {
