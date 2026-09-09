@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,6 +15,7 @@ import (
 )
 
 const observationTimeLayout = "2006-01-02T15:04:05.000000000Z"
+const sqliteSchemaVersion = 1
 
 type SQLiteStore struct { db *sql.DB }
 
@@ -23,12 +25,20 @@ func OpenSQLiteStore(path string) (*SQLiteStore, error) {
 	db, err := sql.Open("sqlite", path); if err != nil { return nil, err }
 	store := &SQLiteStore{db: db}
 	if err := store.migrate(); err != nil { _=db.Close(); return nil,err }
-	if err := store.normalizeLegacyTimes(); err != nil { _=db.Close(); return nil,err }
 	return store,nil
 }
 
 func (s *SQLiteStore) migrate() error {
-	_, err := s.db.Exec(`
+	if s == nil || s.db == nil { return errors.New("sqlite store is not open") }
+	var version int
+	if err := s.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil { return err }
+	if version > sqliteSchemaVersion { return fmt.Errorf("sqlite schema version %d is newer than supported version %d", version, sqliteSchemaVersion) }
+
+	// Version 0 covers both a fresh database and every IRCIntel database created
+	// before explicit schema versioning. CREATE IF NOT EXISTS is intentionally
+	// retained so the same migration safely upgrades legacy installations.
+	if version == 0 {
+		if _, err := s.db.Exec(`
 CREATE TABLE IF NOT EXISTS observations (id INTEGER PRIMARY KEY AUTOINCREMENT, agent_id TEXT NOT NULL, observed_at TEXT NOT NULL, endpoint_host TEXT NOT NULL, endpoint_port TEXT, endpoint_tls INTEGER NOT NULL, payload_json BLOB NOT NULL);
 CREATE INDEX IF NOT EXISTS idx_observations_agent_time ON observations(agent_id, observed_at);
 CREATE INDEX IF NOT EXISTS idx_observations_endpoint_time ON observations(endpoint_host, endpoint_port, observed_at);
@@ -43,8 +53,14 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_networks_name ON networks(name COLLATE NOC
 CREATE TABLE IF NOT EXISTS network_servers (id TEXT PRIMARY KEY, network_id TEXT NOT NULL, name TEXT NOT NULL, FOREIGN KEY(network_id) REFERENCES networks(id));
 CREATE INDEX IF NOT EXISTS idx_network_servers_network ON network_servers(network_id, name);
 CREATE TABLE IF NOT EXISTS network_endpoints (id TEXT PRIMARY KEY, server_id TEXT NOT NULL, host TEXT NOT NULL, port TEXT NOT NULL, tls INTEGER NOT NULL, FOREIGN KEY(server_id) REFERENCES network_servers(id), UNIQUE(server_id, host, port, tls));
-CREATE INDEX IF NOT EXISTS idx_network_endpoints_server ON network_endpoints(server_id, host, port);`)
-	return err
+CREATE INDEX IF NOT EXISTS idx_network_endpoints_server ON network_endpoints(server_id, host, port);`); err != nil { return err }
+
+		// M2.12 historically normalized these columns on every process start. It is
+		// now a one-time v0 -> v1 data migration, eliminating an O(N) startup scan.
+		if err := s.normalizeLegacyTimes(); err != nil { return err }
+		if _, err := s.db.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, sqliteSchemaVersion)); err != nil { return err }
+	}
+	return nil
 }
 
 func (s *SQLiteStore) normalizeLegacyTimes() error {
