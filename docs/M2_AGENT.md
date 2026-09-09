@@ -84,6 +84,19 @@ Status semantics are intentionally simple and deterministic:
 
 The endpoint uses the same optional Core bearer authentication as the observation API.
 
+## M2.7 incident event foundation
+
+M2.7 adds `GET /api/v1/incidents`.
+
+Core scans recent observations and detects reachability transitions independently for each `(agent_id, host, port, tls)` path. The first observation establishes baseline state and does not create an event. Later transitions emit:
+
+- `down` when a previously reachable path becomes unreachable
+- `recovered` when a previously unreachable path becomes reachable
+
+Events include the observing agent, endpoint identity, transition timestamp, and previous observation timestamp. Results are newest first and accept `limit=<1..500>`, default `100`.
+
+These are low-level probe events rather than final public incidents. A later correlation milestone can combine coincident events from several agents, servers, or topology observations into network-level incidents such as regional reachability failures or netsplits.
+
 ## Configuration
 
 Required agent environment variables:
@@ -127,4 +140,4 @@ The M2 agent inherits the M1 privacy model. It does not join channels, collect m
 
 ## Qualification
 
-M2 qualification verifies agent serialization/configuration, HTTP submission/authentication/retry behavior, Core ingest validation, SQLite persistence across close/reopen, filtered and time-bounded observation reads, distributed endpoint aggregation, status semantics, read authentication, dependency cleanliness, application builds, and the OCI runtime gate.
+M2 qualification verifies agent serialization/configuration, HTTP submission/authentication/retry behavior, Core ingest validation, SQLite persistence across close/reopen, filtered and time-bounded observation reads, distributed endpoint aggregation, status semantics, incident transition derivation, read authentication, dependency cleanliness, application builds, and the OCI runtime gate.
