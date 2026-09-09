@@ -8,24 +8,22 @@ import (
 
 func TestSQLiteStoreRollsBackObservationWhenDerivedRefreshFails(t *testing.T) {
 	store, err := OpenSQLiteStore(filepath.Join(t.TempDir(), "ircintel.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	if err != nil { t.Fatal(err) }
 	defer store.Close()
 
-	if err := store.UpsertNetwork(Network{ID: "net-1", Name: "Network 1"}); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.UpsertNetworkServer(NetworkServer{ID: "srv-1", NetworkID: "net-1", Name: "Server 1"}); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.UpsertNetworkEndpoint(NetworkEndpoint{ID: "ep-1", ServerID: "srv-1", Host: "irc.example", Port: "6697", TLS: true}); err != nil {
-		t.Fatal(err)
-	}
+	if err := store.UpsertNetwork(Network{ID: "net-1", Name: "Network 1"}); err != nil { t.Fatal(err) }
+	if err := store.UpsertNetworkServer(NetworkServer{ID: "srv-1", NetworkID: "net-1", Name: "Server 1"}); err != nil { t.Fatal(err) }
+	if err := store.UpsertNetworkEndpoint(NetworkEndpoint{ID: "ep-1", ServerID: "srv-1", Host: "irc.example", Port: "6697", TLS: true}); err != nil { t.Fatal(err) }
 
-	// Seed a deliberately corrupt historical incident payload for the same
-	// network as the incoming observation. Network-scoped derivation must still
-	// reject it and roll back the observation atomically.
+	// Establish persisted per-agent state first. The second observation below is
+	// therefore a real transition and must execute the derived incident path.
+	baseline := validObservation()
+	baseline.Result.Reachable = true
+	if err := store.Store(baseline); err != nil { t.Fatal(err) }
+
+	// Seed a deliberately corrupt incident payload in the affected network.
+	// Network derivation must fail and roll back the transition observation,
+	// transition event, state change, and every other derived write atomically.
 	if _, err := store.db.Exec(`
 INSERT INTO incident_records (
     endpoint_host, endpoint_port, endpoint_tls, started_at, status, payload_json
@@ -36,23 +34,27 @@ INSERT INTO incident_records (
 		t.Fatal(err)
 	}
 
-	if err := store.Store(validObservation()); err == nil {
+	transition := baseline
+	transition.ObservedAt = baseline.ObservedAt.Add(time.Minute)
+	transition.Result.Reachable = false
+	if err := store.Store(transition); err == nil {
 		t.Fatal("expected derived refresh failure")
 	}
 	count, err := store.Count()
-	if err != nil {
-		t.Fatal(err)
+	if err != nil { t.Fatal(err) }
+	if count != 1 {
+		t.Fatalf("observation count=%d want=1 after rollback", count)
 	}
-	if count != 0 {
-		t.Fatalf("observation count=%d want=0 after rollback", count)
+	var transitions int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM endpoint_transition_events`).Scan(&transitions); err != nil { t.Fatal(err) }
+	if transitions != 0 {
+		t.Fatalf("transition count=%d want=0 after rollback", transitions)
 	}
 }
 
 func TestNetworkIncidentRefreshIgnoresUnrelatedNetworkHistory(t *testing.T) {
 	store, err := OpenSQLiteStore(filepath.Join(t.TempDir(), "ircintel.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	if err != nil { t.Fatal(err) }
 	defer store.Close()
 
 	for _, network := range []Network{{ID: "net-a", Name: "A"}, {ID: "net-b", Name: "B"}} {
@@ -65,9 +67,7 @@ func TestNetworkIncidentRefreshIgnoresUnrelatedNetworkHistory(t *testing.T) {
 	if err := store.UpsertNetworkEndpoint(NetworkEndpoint{ID: "ep-b", ServerID: "srv-b", Host: "other.example", Port: "6697", TLS: true}); err != nil { t.Fatal(err) }
 
 	if _, err := store.db.Exec(`INSERT INTO incident_records (endpoint_host, endpoint_port, endpoint_tls, started_at, status, payload_json) VALUES (?, ?, ?, ?, ?, ?)`,
-		"other.example", "6697", true, formatObservationTime(time.Date(2026, 9, 9, 1, 0, 0, 0, time.UTC)), "open", []byte("{")); err != nil {
-		t.Fatal(err)
-	}
+		"other.example", "6697", true, formatObservationTime(time.Date(2026, 9, 9, 1, 0, 0, 0, time.UTC)), "open", []byte("{")); err != nil { t.Fatal(err) }
 
 	if err := store.Store(validObservation()); err != nil {
 		t.Fatalf("unrelated corrupt history should not block ingest: %v", err)
@@ -117,23 +117,13 @@ func TestIncidentRecordsForNetworksTxReturnsOnlyRequestedNetworks(t *testing.T) 
 
 func TestSQLiteStoreAtomicIngestStillCommitsSuccessfulObservation(t *testing.T) {
 	store, err := OpenSQLiteStore(filepath.Join(t.TempDir(), "ircintel.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	if err != nil { t.Fatal(err) }
 	defer store.Close()
 
 	observation := validObservation()
-	if err := store.Store(observation); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.Store(observation); err != nil {
-		t.Fatal(err)
-	}
+	if err := store.Store(observation); err != nil { t.Fatal(err) }
+	if err := store.Store(observation); err != nil { t.Fatal(err) }
 	count, err := store.Count()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if count != 1 {
-		t.Fatalf("observation count=%d want=1", count)
-	}
+	if err != nil { t.Fatal(err) }
+	if count != 1 { t.Fatalf("observation count=%d want=1", count) }
 }
