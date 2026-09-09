@@ -23,6 +23,14 @@ func OpenSQLiteStore(path string) (*SQLiteStore, error) {
 	if path == "" { return nil, errors.New("sqlite path is required") }
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil { return nil, err }
 	db, err := sql.Open("sqlite", path); if err != nil { return nil, err }
+	// SQLite PRAGMAs are connection-scoped. Keep this store on one database
+	// connection so foreign_keys=ON applies consistently to every operation.
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	if _, err := db.Exec(`PRAGMA foreign_keys = ON`); err != nil { _ = db.Close(); return nil, err }
+	var foreignKeys int
+	if err := db.QueryRow(`PRAGMA foreign_keys`).Scan(&foreignKeys); err != nil { _ = db.Close(); return nil, err }
+	if foreignKeys != 1 { _ = db.Close(); return nil, errors.New("sqlite foreign key enforcement unavailable") }
 	store := &SQLiteStore{db: db}
 	if err := store.migrate(); err != nil { _=db.Close(); return nil,err }
 	return store,nil
