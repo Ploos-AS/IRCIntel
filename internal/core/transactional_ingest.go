@@ -9,13 +9,18 @@ import (
 	"github.com/Ploos-AS/IRCIntel/internal/agent"
 )
 
-// refreshIncidentRecordsTx derives and persists endpoint incidents using the
-// caller's transaction. This lets observation ingestion and every derived write
-// commit or roll back as one unit.
+// refreshIncidentRecordsTx derives and persists incidents only for the endpoint
+// touched by the observation that triggered the current transaction. Earlier
+// versions rescanned the newest incidentScanLimit observations globally on every
+// ingest. Endpoint scoping preserves the existing correlation/lifecycle model
+// while avoiding unrelated observation history and cross-endpoint corruption.
 func refreshIncidentRecordsTx(tx *sql.Tx) error {
-	observations, err := recentObservationsTx(tx, incidentScanLimit)
+	observations, err := observationsForLatestEndpointTx(tx)
 	if err != nil {
 		return err
+	}
+	if len(observations) == 0 {
+		return nil
 	}
 	events := deriveIncidentEvents(observations)
 	correlated := correlateIncidentEvents(events, defaultCorrelationWindow)
@@ -42,6 +47,49 @@ DO UPDATE SET status = excluded.status, payload_json = excluded.payload_json`,
 		}
 	}
 	return nil
+}
+
+func observationsForLatestEndpointTx(tx *sql.Tx) ([]agent.Observation, error) {
+	var host, port string
+	var tls bool
+	if err := tx.QueryRow(`
+SELECT endpoint_host, COALESCE(endpoint_port, ''), endpoint_tls
+FROM observations
+ORDER BY id DESC
+LIMIT 1`).Scan(&host, &port, &tls); err != nil {
+		if err == sql.ErrNoRows {
+			return []agent.Observation{}, nil
+		}
+		return nil, err
+	}
+
+	rows, err := tx.Query(`
+SELECT payload_json
+FROM observations
+WHERE endpoint_host = ?
+  AND COALESCE(endpoint_port, '') = ?
+  AND endpoint_tls = ?
+ORDER BY observed_at DESC, id DESC`, host, port, tls)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]agent.Observation, 0)
+	for rows.Next() {
+		var payload []byte
+		if err := rows.Scan(&payload); err != nil {
+			return nil, err
+		}
+		var observation agent.Observation
+		if err := json.Unmarshal(payload, &observation); err != nil {
+			return nil, err
+		}
+		out = append(out, observation)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 func recentObservationsTx(tx *sql.Tx, limit int) ([]agent.Observation, error) {
