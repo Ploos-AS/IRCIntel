@@ -33,9 +33,25 @@ M2.3 replaces the temporary in-memory runtime backend with SQLite persistence wh
 
 Core opens `IRCINTEL_DB_PATH`, default `/data/ircintel.db`, creates the database directory if needed, and applies an idempotent initial schema on startup. Every accepted observation stores searchable agent/endpoint/timestamp columns plus the complete normalized observation envelope as JSON. Indexes cover agent/time and endpoint/time queries.
 
-The SQLite driver is pure Go (`modernc.org/sqlite`), so the production image remains CGO-free and can continue using a `scratch` runtime. `/data` is provisioned for UID/GID `65532:65532`. Compose uses the `ircintel-data` named volume, and Quadlet uses `deploy/ircintel-data.volume`.
+The SQLite driver is pure Go and pinned to `modernc.org/sqlite v1.46.0`, preserving the Go 1.24 baseline and CGO-free `scratch` runtime. `/data` is provisioned for UID/GID `65532:65532`. Compose uses the `ircintel-data` named volume, and Quadlet uses `deploy/ircintel-data.volume`.
 
-The initial schema is deliberately small; public history/query APIs and retention/aggregation are later milestones.
+## M2.4 observation read API
+
+M2.4 adds `GET /api/v1/observations` over the same SQLite store.
+
+The endpoint returns newest observations first and supports exact filters:
+
+- `agent_id=<id>`
+- `host=<hostname>`
+- `limit=<1..500>`, default `50`
+
+When `IRCINTEL_CORE_TOKEN` is configured, reads use the same bearer authentication as ingestion. This keeps the development Core closed by default while preserving a clean boundary for a later intentionally public API.
+
+Responses use a stable envelope:
+
+```json
+{"observations": []}
+```
 
 ## Configuration
 
@@ -51,7 +67,7 @@ Optional agent/Core environment variables:
 - `IRCINTEL_AGENT_NICK`: IRC probe nick, default `IRCIntelProbe`
 - `IRCINTEL_AGENT_USERNAME`: IRC probe username, default `ircintel`
 - `IRCINTEL_CORE_URL`: Core observation ingestion URL; unset means stdout mode
-- `IRCINTEL_CORE_TOKEN`: bearer token used by the agent and, when set on Core, required by ingestion
+- `IRCINTEL_CORE_TOKEN`: bearer token used by agent and Core HTTP endpoints
 - `IRCINTEL_AGENT_RETRIES`: retry count after the initial submission attempt, default `3`
 - `IRCINTEL_DB_PATH`: Core SQLite path, default `/data/ircintel.db`
 
@@ -80,4 +96,4 @@ The M2 agent inherits the M1 privacy model. It does not join channels, collect m
 
 ## Qualification
 
-M2 qualification verifies agent serialization/configuration, HTTP submission/authentication/retry behavior, Core ingest validation, and SQLite persistence across close/reopen. CI must continue to pass `go test ./...`, `go vet ./...`, application builds, and the OCI runtime gate.
+M2 qualification verifies agent serialization/configuration, HTTP submission/authentication/retry behavior, Core ingest validation, SQLite persistence across close/reopen, filtered observation reads, result ordering, bounded query limits, and read authentication. CI must continue to pass `go mod tidy` with a clean dependency diff, `go test ./...`, `go vet ./...`, application builds, and the OCI runtime gate.
