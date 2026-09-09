@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"net"
@@ -20,17 +21,29 @@ type Config struct {
 	Timeout    time.Duration
 }
 
+type TLSMetadata struct {
+	Version      string   `json:"version,omitempty"`
+	CipherSuite  string   `json:"cipher_suite,omitempty"`
+	Issuer       string   `json:"issuer,omitempty"`
+	Subject      string   `json:"subject,omitempty"`
+	NotBefore    string   `json:"not_before,omitempty"`
+	NotAfter     string   `json:"not_after,omitempty"`
+	DNSNames     []string `json:"dns_names,omitempty"`
+	IPAddresses []string `json:"ip_addresses,omitempty"`
+}
+
 type Result struct {
-	Host              string   `json:"host"`
-	Port              string   `json:"port"`
-	TLS               bool     `json:"tls"`
-	ResolvedAddresses []string `json:"resolved_addresses,omitempty"`
-	DNSLatencyMS      int64    `json:"dns_latency_ms"`
-	ConnectLatencyMS  int64    `json:"connect_latency_ms"`
-	TLSLatencyMS      int64    `json:"tls_latency_ms,omitempty"`
-	RegistrationMS    int64    `json:"registration_latency_ms"`
-	Capabilities      []string `json:"capabilities,omitempty"`
-	Server            string   `json:"server,omitempty"`
+	Host              string       `json:"host"`
+	Port              string       `json:"port"`
+	TLS               bool         `json:"tls"`
+	ResolvedAddresses []string     `json:"resolved_addresses,omitempty"`
+	DNSLatencyMS      int64        `json:"dns_latency_ms"`
+	ConnectLatencyMS  int64        `json:"connect_latency_ms"`
+	TLSLatencyMS      int64        `json:"tls_latency_ms,omitempty"`
+	TLSMetadata       *TLSMetadata `json:"tls_metadata,omitempty"`
+	RegistrationMS    int64        `json:"registration_latency_ms"`
+	Capabilities      []string     `json:"capabilities,omitempty"`
+	Server            string       `json:"server,omitempty"`
 }
 
 func (r *Runner) Run(ctx context.Context, cfg Config) (Result, error) {
@@ -66,6 +79,8 @@ func (r *Runner) Run(ctx context.Context, cfg Config) (Result, error) {
 		tlsStart := time.Now()
 		if err := tlsConn.HandshakeContext(ctx); err != nil { return result, fmt.Errorf("tls handshake: %w", err) }
 		result.TLSLatencyMS = time.Since(tlsStart).Milliseconds()
+		metadata := metadataFromTLSState(tlsConn.ConnectionState())
+		result.TLSMetadata = &metadata
 		conn = tlsConn
 	}
 
@@ -116,6 +131,42 @@ func (r *Runner) Run(ctx context.Context, cfg Config) (Result, error) {
 	}
 	if err := scanner.Err(); err != nil { return result, fmt.Errorf("irc read: %w", err) }
 	return result, errors.New("connection closed before IRC registration completed")
+}
+
+func metadataFromTLSState(state tls.ConnectionState) TLSMetadata {
+	metadata := TLSMetadata{
+		Version:     tlsVersionName(state.Version),
+		CipherSuite: tls.CipherSuiteName(state.CipherSuite),
+	}
+	if len(state.PeerCertificates) == 0 { return metadata }
+	populateCertificateMetadata(&metadata, state.PeerCertificates[0])
+	return metadata
+}
+
+func populateCertificateMetadata(metadata *TLSMetadata, cert *x509.Certificate) {
+	metadata.Issuer = cert.Issuer.String()
+	metadata.Subject = cert.Subject.String()
+	metadata.NotBefore = cert.NotBefore.UTC().Format(time.RFC3339)
+	metadata.NotAfter = cert.NotAfter.UTC().Format(time.RFC3339)
+	metadata.DNSNames = append([]string(nil), cert.DNSNames...)
+	for _, ip := range cert.IPAddresses { metadata.IPAddresses = append(metadata.IPAddresses, ip.String()) }
+	sort.Strings(metadata.DNSNames)
+	sort.Strings(metadata.IPAddresses)
+}
+
+func tlsVersionName(version uint16) string {
+	switch version {
+	case tls.VersionTLS13:
+		return "TLS 1.3"
+	case tls.VersionTLS12:
+		return "TLS 1.2"
+	case tls.VersionTLS11:
+		return "TLS 1.1"
+	case tls.VersionTLS10:
+		return "TLS 1.0"
+	default:
+		return fmt.Sprintf("0x%04x", version)
+	}
 }
 
 func capLSIndex(parts []string) (int, bool) {
