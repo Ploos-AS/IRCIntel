@@ -12,7 +12,7 @@ import (
 const maxDiscoveryReviewBytes int64 = 64 * 1024
 
 var (
-	ErrDiscoveryCandidateNotFound       = errors.New("discovery candidate not found")
+	ErrDiscoveryCandidateNotFound         = errors.New("discovery candidate not found")
 	ErrDiscoveryCandidateAlreadyReviewed = errors.New("discovery candidate already reviewed")
 )
 
@@ -118,26 +118,9 @@ func (h DiscoveryReviewHandler) authorize(w http.ResponseWriter, r *http.Request
 	return true
 }
 
-func (s *SQLiteStore) ensureDiscoveryReviewSchema() error {
-	if s == nil || s.db == nil {
-		return errors.New("sqlite store is not open")
-	}
-	_, err := s.db.Exec(`
-CREATE TABLE IF NOT EXISTS discovery_reviews (
-    candidate_id TEXT PRIMARY KEY,
-    status TEXT NOT NULL,
-    reviewer TEXT NOT NULL,
-    note TEXT NOT NULL DEFAULT '',
-    reviewed_at TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_discovery_reviews_time
-    ON discovery_reviews(reviewed_at DESC);`)
-	return err
-}
-
 func (s *SQLiteStore) ReviewDiscoveryCandidate(input DiscoveryReviewInput, reviewedAt time.Time) (DiscoveryReview, error) {
-	if err := s.ensureDiscoveryReviewSchema(); err != nil {
-		return DiscoveryReview{}, err
+	if s == nil || s.db == nil {
+		return DiscoveryReview{}, errors.New("sqlite store is not open")
 	}
 	input.CandidateID = strings.TrimSpace(input.CandidateID)
 	input.Status = strings.ToLower(strings.TrimSpace(input.Status))
@@ -190,8 +173,8 @@ VALUES (?, ?, ?, ?, ?)`, input.CandidateID, input.Status, input.Reviewer, input.
 }
 
 func (s *SQLiteStore) ListDiscoveryReviews() ([]DiscoveryReview, error) {
-	if err := s.ensureDiscoveryReviewSchema(); err != nil {
-		return nil, err
+	if s == nil || s.db == nil {
+		return nil, errors.New("sqlite store is not open")
 	}
 	rows, err := s.db.Query(`SELECT candidate_id, status, reviewer, note, reviewed_at FROM discovery_reviews ORDER BY reviewed_at DESC, candidate_id`)
 	if err != nil {
