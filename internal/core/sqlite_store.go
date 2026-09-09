@@ -71,6 +71,33 @@ CREATE INDEX IF NOT EXISTS idx_incident_records_started
     ON incident_records(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_incident_records_status
     ON incident_records(status, started_at DESC);
+CREATE TABLE IF NOT EXISTS networks (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    website TEXT NOT NULL DEFAULT '',
+    description TEXT NOT NULL DEFAULT ''
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_networks_name
+    ON networks(name COLLATE NOCASE);
+CREATE TABLE IF NOT EXISTS network_servers (
+    id TEXT PRIMARY KEY,
+    network_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    FOREIGN KEY(network_id) REFERENCES networks(id)
+);
+CREATE INDEX IF NOT EXISTS idx_network_servers_network
+    ON network_servers(network_id, name);
+CREATE TABLE IF NOT EXISTS network_endpoints (
+    id TEXT PRIMARY KEY,
+    server_id TEXT NOT NULL,
+    host TEXT NOT NULL,
+    port TEXT NOT NULL,
+    tls INTEGER NOT NULL,
+    FOREIGN KEY(server_id) REFERENCES network_servers(id),
+    UNIQUE(server_id, host, port, tls)
+);
+CREATE INDEX IF NOT EXISTS idx_network_endpoints_server
+    ON network_endpoints(server_id, host, port);
 `)
 	return err
 }
