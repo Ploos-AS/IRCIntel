@@ -34,19 +34,20 @@ type TLSMetadata struct {
 }
 
 type Result struct {
-	Host              string       `json:"host"`
-	Port              string       `json:"port"`
-	TLS               bool         `json:"tls"`
-	AddressFamily     string       `json:"address_family,omitempty"`
-	SelectedAddress   string       `json:"selected_address,omitempty"`
-	ResolvedAddresses []string     `json:"resolved_addresses,omitempty"`
-	DNSLatencyMS      int64        `json:"dns_latency_ms"`
-	ConnectLatencyMS  int64        `json:"connect_latency_ms"`
-	TLSLatencyMS      int64        `json:"tls_latency_ms,omitempty"`
-	TLSMetadata       *TLSMetadata `json:"tls_metadata,omitempty"`
-	RegistrationMS    int64        `json:"registration_latency_ms"`
-	Capabilities      []string     `json:"capabilities,omitempty"`
-	Server            string       `json:"server,omitempty"`
+	Host              string          `json:"host"`
+	Port              string          `json:"port"`
+	TLS               bool            `json:"tls"`
+	AddressFamily     string          `json:"address_family,omitempty"`
+	SelectedAddress   string          `json:"selected_address,omitempty"`
+	ResolvedAddresses []string        `json:"resolved_addresses,omitempty"`
+	DNSLatencyMS      int64           `json:"dns_latency_ms"`
+	ConnectLatencyMS  int64           `json:"connect_latency_ms"`
+	TLSLatencyMS      int64           `json:"tls_latency_ms,omitempty"`
+	TLSMetadata       *TLSMetadata    `json:"tls_metadata,omitempty"`
+	RegistrationMS    int64           `json:"registration_latency_ms"`
+	Capabilities      []string        `json:"capabilities,omitempty"`
+	Server            string          `json:"server,omitempty"`
+	ServerMetadata    *ServerMetadata `json:"server_metadata,omitempty"`
 }
 
 func (r *Runner) Run(ctx context.Context, cfg Config) (Result, error) {
@@ -113,10 +114,13 @@ func (r *Runner) Run(ctx context.Context, cfg Config) (Result, error) {
 	scanner.Buffer(make([]byte, 4096), 256*1024)
 	caps := map[string]struct{}{}
 	capEnded := false
+	serverMetadata := ServerMetadata{}
 	for scanner.Scan() {
 		line := scanner.Text()
 		parts := strings.Fields(line)
 		if len(parts) > 0 && strings.HasPrefix(parts[0], ":") && result.Server == "" { result.Server = strings.TrimPrefix(parts[0], ":") }
+		parseServerSoftware(parts, &serverMetadata)
+		parseISupport(parts, &serverMetadata)
 
 		if strings.HasPrefix(line, "PING ") {
 			payload := strings.TrimSpace(strings.TrimPrefix(line, "PING"))
@@ -140,6 +144,9 @@ func (r *Runner) Run(ctx context.Context, cfg Config) (Result, error) {
 			_, _ = fmt.Fprint(conn, "QUIT :IRCIntel probe complete\r\n")
 			for capability := range caps { result.Capabilities = append(result.Capabilities, capability) }
 			sort.Strings(result.Capabilities)
+			if serverMetadata.Network != "" || serverMetadata.Software != "" || serverMetadata.SoftwareVersion != "" || len(serverMetadata.ISupport) > 0 {
+				result.ServerMetadata = &serverMetadata
+			}
 			return result, nil
 		}
 	}
