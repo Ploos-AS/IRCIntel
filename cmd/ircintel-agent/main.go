@@ -17,12 +17,22 @@ func run(ctx context.Context) error {
 	if err != nil { return err }
 	runner, err := probe.NewRunner(cfg.Identity, cfg.Policy)
 	if err != nil { return err }
+
+	var submitter agent.Submitter = agent.WriterSubmitter{Writer: os.Stdout}
+	if cfg.CoreURL != "" {
+		submitter = agent.HTTPSubmitter{
+			URL:     cfg.CoreURL,
+			Token:   cfg.CoreToken,
+			Retries: cfg.Retries,
+		}
+	}
+
 	a := agent.Agent{
 		ID:        cfg.ID,
 		Interval:  cfg.Interval,
 		Endpoints: cfg.Endpoints,
 		Runner:    runner,
-		Output:    os.Stdout,
+		Submitter: submitter,
 	}
 	return a.Run(ctx)
 }
