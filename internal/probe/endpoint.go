@@ -10,12 +10,12 @@ import (
 // FamilyMeasurement is one address-family observation for an IRC endpoint.
 // Probe failures are data: a failed IPv6 path must not erase a successful IPv4 path.
 type FamilyMeasurement struct {
-	Family    string  `json:"family"`
-	OK        bool    `json:"ok"`
-	Result    *Result `json:"result,omitempty"`
-	Error     string  `json:"error,omitempty"`
-	ErrorCode string  `json:"error_code,omitempty"`
-	ErrorStage string `json:"error_stage,omitempty"`
+	Family     string  `json:"family"`
+	OK         bool    `json:"ok"`
+	Result     *Result `json:"result,omitempty"`
+	Error      string  `json:"error,omitempty"`
+	ErrorCode  string  `json:"error_code,omitempty"`
+	ErrorStage string  `json:"error_stage,omitempty"`
 }
 
 // EndpointResult groups the IPv4 and IPv6 observations that belong to one
@@ -36,13 +36,13 @@ func (r *Runner) RunEndpoint(ctx context.Context, cfg Config) (EndpointResult, e
 	if strings.TrimSpace(cfg.Host) == "" {
 		return EndpointResult{}, probeError(CodeInvalidConfig, "config", errors.New("probe host is required"))
 	}
-	if err := r.authorize(cfg.Host); err != nil {
-		return EndpointResult{Host: cfg.Host, Port: cfg.Port, TLS: cfg.TLS}, err
-	}
 
 	port := cfg.Port
 	if port == "" {
 		if cfg.TLS { port = "6697" } else { port = "6667" }
+	}
+	if err := r.authorizeEndpoint(cfg.Host, port, cfg.TLS); err != nil {
+		return EndpointResult{Host: cfg.Host, Port: port, TLS: cfg.TLS}, err
 	}
 	out := EndpointResult{Host: cfg.Host, Port: port, TLS: cfg.TLS}
 
@@ -64,6 +64,7 @@ func (r *Runner) RunEndpoint(ctx context.Context, cfg Config) (EndpointResult, e
 				return
 			}
 			childCfg := cfg
+			childCfg.Port = port
 			childCfg.Family = family
 			result, err := child.Run(ctx, childCfg)
 			measurement := FamilyMeasurement{Family: family}
