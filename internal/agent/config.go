@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -16,6 +17,9 @@ type Config struct {
 	Endpoints []Endpoint
 	Identity  probe.Identity
 	Policy    probe.Policy
+	CoreURL   string
+	CoreToken string
+	Retries   int
 }
 
 func ConfigFromEnv() (Config, error) {
@@ -41,6 +45,15 @@ func ConfigFromEnv() (Config, error) {
 	username := strings.TrimSpace(os.Getenv("IRCINTEL_AGENT_USERNAME"))
 	if username == "" { username = "ircintel" }
 	cfg.Identity = probe.Identity{Nick: nick, Username: username, Realname: "IRCIntel distributed probe", Contact: contact}
+
+	cfg.CoreURL = strings.TrimSpace(os.Getenv("IRCINTEL_CORE_URL"))
+	cfg.CoreToken = strings.TrimSpace(os.Getenv("IRCINTEL_CORE_TOKEN"))
+	cfg.Retries = 3
+	if raw := strings.TrimSpace(os.Getenv("IRCINTEL_AGENT_RETRIES")); raw != "" {
+		retries, err := strconv.Atoi(raw)
+		if err != nil || retries < 0 { return cfg, errors.New("IRCINTEL_AGENT_RETRIES must be a non-negative integer") }
+		cfg.Retries = retries
+	}
 
 	allowHosts := make([]string, 0, len(cfg.Endpoints))
 	seen := map[string]struct{}{}
