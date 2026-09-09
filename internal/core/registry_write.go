@@ -54,7 +54,7 @@ func (h RegistryWriteHandler) Server(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := h.Writer.UpsertNetworkServer(item); err != nil {
-		if strings.Contains(err.Error(), "network does not exist") {
+		if errors.Is(err, ErrRegistryNetworkNotFound) {
 			http.Error(w, "network does not exist", http.StatusConflict)
 			return
 		}
@@ -78,7 +78,7 @@ func (h RegistryWriteHandler) Endpoint(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := h.Writer.UpsertNetworkEndpoint(item); err != nil {
-		if strings.Contains(err.Error(), "server does not exist") {
+		if errors.Is(err, ErrRegistryServerNotFound) {
 			http.Error(w, "server does not exist", http.StatusConflict)
 			return
 		}
