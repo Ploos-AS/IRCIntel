@@ -32,6 +32,7 @@ func main() {
 	incidents := core.IncidentHandler{Token: token, Reader: store}
 	distributedIncidents := core.DistributedIncidentHandler{Token: token, Reader: store}
 	incidentLifecycle := core.IncidentLifecycleHandler{Token: token, Reader: store}
+	registry := core.RegistryHandler{Token: token, Reader: store}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
@@ -49,6 +50,7 @@ func main() {
 	mux.Handle("GET /api/v1/incidents", incidents)
 	mux.Handle("GET /api/v1/incidents/distributed", distributedIncidents)
 	mux.Handle("GET /api/v1/incidents/lifecycle", incidentLifecycle)
+	mux.Handle("GET /api/v1/registry", registry)
 
 	srv := &http.Server{
 		Addr:              listen,
