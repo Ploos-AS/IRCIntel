@@ -34,6 +34,12 @@ func TestRunEndpointMixedFamilyResult(t *testing.T) {
 	if result.Measurements[1].Error == "" {
 		t.Fatal("expected structured ipv6 error")
 	}
+	if result.Measurements[1].ErrorCode != CodeTCPConnectFailed && result.Measurements[1].ErrorCode != CodeNoIPv6Address {
+		t.Fatalf("unexpected ipv6 error code: %+v", result.Measurements[1])
+	}
+	if result.Measurements[1].ErrorStage == "" {
+		t.Fatalf("missing ipv6 error stage: %+v", result.Measurements[1])
+	}
 	if !result.Reachable {
 		t.Fatal("endpoint should be reachable when one family succeeds")
 	}
