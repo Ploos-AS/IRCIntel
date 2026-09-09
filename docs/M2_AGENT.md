@@ -15,7 +15,22 @@ The initial agent foundation provides:
 - normalized newline-delimited JSON observations on stdout
 - graceful SIGINT/SIGTERM shutdown
 
-M2.0 intentionally does not define the Core submission protocol yet. Keeping the first output boundary as structured JSON makes the measurement envelope testable without prematurely freezing authentication, queueing, retry, or transport semantics.
+## M2.1 Core submission transport
+
+M2.1 adds an explicit observation submission boundary and the first Core transport.
+
+When `IRCINTEL_CORE_URL` is unset, the agent preserves the M2.0 behavior and emits one NDJSON observation per endpoint to stdout. When `IRCINTEL_CORE_URL` is configured, each observation is POSTed as `application/json` to that URL.
+
+The HTTP transport:
+
+- accepts any successful 2xx response
+- optionally sends `Authorization: Bearer <token>`
+- uses a bounded HTTP client timeout
+- retries transient submission failures with exponential backoff
+- keeps retry behavior cancellable through the agent context
+- returns the final submission error rather than silently dropping observations
+
+M2.1 deliberately does not yet add a durable local spool. If Core remains unavailable after the configured retries, the agent run fails visibly. Durable queueing/spooling is a later hardening step.
 
 ## Configuration
 
@@ -30,6 +45,9 @@ Optional environment variables:
 - `IRCINTEL_AGENT_INTERVAL`: measurement interval, default `5m`
 - `IRCINTEL_AGENT_NICK`: IRC probe nick, default `IRCIntelProbe`
 - `IRCINTEL_AGENT_USERNAME`: IRC probe username, default `ircintel`
+- `IRCINTEL_CORE_URL`: Core observation ingestion URL; unset means stdout mode
+- `IRCINTEL_CORE_TOKEN`: optional bearer token for Core authentication
+- `IRCINTEL_AGENT_RETRIES`: retry count after the initial submission attempt, default `3`
 
 Example target configuration:
 
@@ -44,7 +62,7 @@ The endpoint host set is also used to construct the probe allowlist. The probe e
 
 ## Observation envelope
 
-Each completed endpoint measurement emits one JSON object containing:
+Each completed endpoint measurement produces one JSON object containing:
 
 - `agent_id`
 - UTC `observed_at`
@@ -65,7 +83,7 @@ The M2 agent inherits the M1 privacy model. It does not join channels, collect m
 
 ## Qualification
 
-M2.0 tests verify:
+M2 qualification verifies:
 
 - deterministic observation serialization
 - propagation of endpoint configuration to the probe runner
@@ -73,5 +91,10 @@ M2.0 tests verify:
 - required configuration validation
 - default nick/username behavior
 - target-derived allowlist construction and host deduplication
+- HTTP POST method and JSON content type
+- optional bearer-token propagation
+- acceptance of 2xx responses
+- retry of failed submissions
+- final failure propagation when retries are exhausted
 
 CI must continue to pass `go test ./...`, `go vet ./...`, application builds, and the OCI runtime gate.
