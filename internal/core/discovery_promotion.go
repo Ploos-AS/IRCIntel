@@ -1,6 +1,7 @@
 package core
 
 import (
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"io"
@@ -12,9 +13,10 @@ import (
 const maxDiscoveryPromotionBytes int64 = 64 * 1024
 
 var (
-	ErrDiscoveryCandidateNotAccepted = errors.New("discovery candidate is not accepted")
-	ErrDiscoveryCandidatePromoted    = errors.New("discovery candidate already promoted")
-	ErrDiscoveryPromotionServer      = errors.New("promotion server does not exist")
+	ErrDiscoveryCandidateNotAccepted    = errors.New("discovery candidate is not accepted")
+	ErrDiscoveryCandidatePromoted       = errors.New("discovery candidate already promoted")
+	ErrDiscoveryPromotionServer         = errors.New("promotion server does not exist")
+	ErrDiscoveryPromotionEndpointConflict = errors.New("promotion endpoint conflicts with existing registry endpoint")
 )
 
 type DiscoveryPromotion struct {
@@ -86,6 +88,8 @@ func (h DiscoveryPromotionHandler) Promote(w http.ResponseWriter, r *http.Reques
 			http.Error(w, "discovery candidate already promoted", http.StatusConflict)
 		case errors.Is(err, ErrDiscoveryPromotionServer):
 			http.Error(w, "promotion server does not exist", http.StatusConflict)
+		case errors.Is(err, ErrDiscoveryPromotionEndpointConflict):
+			http.Error(w, "promotion endpoint conflicts with existing registry endpoint", http.StatusConflict)
 		default:
 			http.Error(w, "discovery promotion failed", http.StatusServiceUnavailable)
 		}
@@ -152,7 +156,7 @@ func (s *SQLiteStore) PromoteDiscoveryCandidate(input DiscoveryPromotionInput, p
 	var host, port, status string
 	var tls bool
 	if err := tx.QueryRow(`SELECT host, port, tls, status FROM discovery_candidates WHERE id = ?`, input.CandidateID).Scan(&host, &port, &tls, &status); err != nil {
-		if strings.Contains(strings.ToLower(err.Error()), "no rows") {
+		if errors.Is(err, sql.ErrNoRows) {
 			return DiscoveryPromotion{}, ErrDiscoveryCandidateNotFound
 		}
 		return DiscoveryPromotion{}, err
@@ -160,6 +164,7 @@ func (s *SQLiteStore) PromoteDiscoveryCandidate(input DiscoveryPromotionInput, p
 	if status != "accepted" {
 		return DiscoveryPromotion{}, ErrDiscoveryCandidateNotAccepted
 	}
+
 	var promoted int
 	if err := tx.QueryRow(`SELECT COUNT(*) FROM discovery_promotions WHERE candidate_id = ?`, input.CandidateID).Scan(&promoted); err != nil {
 		return DiscoveryPromotion{}, err
@@ -167,6 +172,7 @@ func (s *SQLiteStore) PromoteDiscoveryCandidate(input DiscoveryPromotionInput, p
 	if promoted != 0 {
 		return DiscoveryPromotion{}, ErrDiscoveryCandidatePromoted
 	}
+
 	var serverExists int
 	if err := tx.QueryRow(`SELECT COUNT(*) FROM network_servers WHERE id = ?`, input.ServerID).Scan(&serverExists); err != nil {
 		return DiscoveryPromotion{}, err
@@ -174,6 +180,22 @@ func (s *SQLiteStore) PromoteDiscoveryCandidate(input DiscoveryPromotionInput, p
 	if serverExists == 0 {
 		return DiscoveryPromotion{}, ErrDiscoveryPromotionServer
 	}
+
+	// Classify both registry uniqueness constraints before attempting the insert:
+	// endpoint ID must be globally unique, and server+host+port+TLS must not already
+	// exist under another endpoint ID. This keeps expected administrative conflicts
+	// out of the generic storage-error/503 path.
+	var endpointConflict int
+	if err := tx.QueryRow(`
+SELECT COUNT(*) FROM network_endpoints
+WHERE id = ? OR (server_id = ? AND host = ? AND port = ? AND tls = ?)`,
+		input.EndpointID, input.ServerID, host, port, tls).Scan(&endpointConflict); err != nil {
+		return DiscoveryPromotion{}, err
+	}
+	if endpointConflict != 0 {
+		return DiscoveryPromotion{}, ErrDiscoveryPromotionEndpointConflict
+	}
+
 	if _, err := tx.Exec(`
 INSERT INTO network_endpoints (id, server_id, host, port, tls)
 VALUES (?, ?, ?, ?, ?)`, input.EndpointID, input.ServerID, host, port, tls); err != nil {
