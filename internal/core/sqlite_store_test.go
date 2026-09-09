@@ -158,7 +158,7 @@ func TestSQLiteStoreV2ToV3DeduplicatesLegacyObservations(t *testing.T) {
 	if count != 1 { t.Fatalf("count=%d want=1", count) }
 	var version int
 	if err := reopened.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil { t.Fatal(err) }
-	if version != 3 { t.Fatalf("user_version=%d want=3", version) }
+	if version != sqliteSchemaVersion { t.Fatalf("user_version=%d want=%d", version, sqliteSchemaVersion) }
 	if err := reopened.Store(observation); err != nil { t.Fatal(err) }
 	count, err = reopened.Count()
 	if err != nil { t.Fatal(err) }
