@@ -11,7 +11,7 @@ import (
 
 func TestServerMetadataParsers(t *testing.T) {
 	metadata := ServerMetadata{}
-	parseServerSoftware([]string{":irc.example", "004", "irc.example", "ircd-2.0", "io", "k", "beI"}, &metadata)
+	parseServerSoftware([]string{":irc.example", "004", "nick", "irc.example", "ircd-2.0", "io", "k", "beI"}, &metadata)
 	parseISupport([]string{":irc.example", "005", "nick", "NETWORK=ExampleNet", "CHANTYPES=#&", "PREFIX=(ov)@+", ":are supported"}, &metadata)
 
 	if metadata.Software != "irc.example" || metadata.SoftwareVersion != "ircd-2.0" {
