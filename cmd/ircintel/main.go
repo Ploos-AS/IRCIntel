@@ -19,7 +19,12 @@ type versionResponse struct {
 
 func main() {
 	listen := getenv("IRCINTEL_LISTEN", ":8080")
-	store := &core.MemoryStore{}
+	dbPath := getenv("IRCINTEL_DB_PATH", "/data/ircintel.db")
+	store, err := core.OpenSQLiteStore(dbPath)
+	if err != nil {
+		log.Fatalf("open observation store: %v", err)
+	}
+	defer store.Close()
 	ingest := core.IngestHandler{Token: os.Getenv("IRCINTEL_CORE_TOKEN"), Store: store}
 
 	mux := http.NewServeMux()
