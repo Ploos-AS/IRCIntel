@@ -125,6 +125,12 @@ INSERT OR IGNORE INTO endpoint_transition_events (
 	return err
 }
 
+// transitionEventsForLatestEndpointTx returns only the transition history that
+// can still affect the latest persisted lifecycle for the endpoint. Once a
+// lifecycle exists, older transition clusters cannot change it; we retain one
+// correlation window before the checkpoint so a cluster crossing the boundary
+// is reconstructed exactly. Endpoints without a lifecycle still bootstrap from
+// their complete transition history.
 func transitionEventsForLatestEndpointTx(tx *sql.Tx) ([]IncidentEvent, error) {
 	var host, port string
 	var tls bool
@@ -138,11 +144,36 @@ LIMIT 1`).Scan(&host, &port, &tls); err != nil {
 		}
 		return nil, err
 	}
-	rows, err := tx.Query(`
+
+	var checkpoint string
+	err := tx.QueryRow(`
+SELECT started_at
+FROM incident_records
+WHERE endpoint_host = ?
+  AND COALESCE(endpoint_port, '') = ?
+  AND endpoint_tls = ?
+ORDER BY started_at DESC, id DESC
+LIMIT 1`, host, port, tls).Scan(&checkpoint)
+	if err != nil && err != sql.ErrNoRows {
+		return nil, err
+	}
+
+	statement := `
 SELECT agent_id, event_type, observed_at, previous_observed_at
 FROM endpoint_transition_events
-WHERE endpoint_host = ? AND endpoint_port = ? AND endpoint_tls = ?
-ORDER BY observed_at DESC, agent_id`, host, port, tls)
+WHERE endpoint_host = ? AND endpoint_port = ? AND endpoint_tls = ?`
+	args := []any{host, port, tls}
+	if err == nil {
+		checkpointTime, parseErr := time.Parse(observationTimeLayout, checkpoint)
+		if parseErr != nil {
+			return nil, parseErr
+		}
+		statement += ` AND observed_at >= ?`
+		args = append(args, formatObservationTime(checkpointTime.Add(-defaultCorrelationWindow)))
+	}
+	statement += ` ORDER BY observed_at DESC, agent_id`
+
+	rows, err := tx.Query(statement, args...)
 	if err != nil {
 		return nil, err
 	}
