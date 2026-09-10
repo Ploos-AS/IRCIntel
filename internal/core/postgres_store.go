@@ -13,7 +13,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-const postgresSchemaVersion = 2
+const postgresSchemaVersion = 3
 const postgresOperationTimeout = 10 * time.Second
 
 type PostgresStore struct {
@@ -129,6 +129,15 @@ CREATE INDEX IF NOT EXISTS idx_pg_network_endpoints_server ON network_endpoints(
 		if _, err := tx.Exec(ctx, `INSERT INTO schema_migrations(version) VALUES (2)`); err != nil {
 			return fmt.Errorf("record postgres migration v2: %w", err)
 		}
+		version = 2
+	}
+	if version < 3 {
+		if err := migratePostgresNetworkIncidents(ctx, tx); err != nil {
+			return fmt.Errorf("apply postgres migration v3: %w", err)
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO schema_migrations(version) VALUES (3)`); err != nil {
+			return fmt.Errorf("record postgres migration v3: %w", err)
+		}
 	}
 	return tx.Commit(ctx)
 }
@@ -175,6 +184,9 @@ RETURNING id`,
 	}
 	if transitioned {
 		if err := refreshPostgresIncidentRecordsForEndpointTx(ctx, tx, observation.Endpoint.Host, observation.Endpoint.Port, observation.Endpoint.TLS); err != nil {
+			return err
+		}
+		if err := refreshPostgresNetworkIncidentRecordsTx(ctx, tx); err != nil {
 			return err
 		}
 	}
