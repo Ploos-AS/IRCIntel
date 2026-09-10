@@ -13,7 +13,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-const postgresSchemaVersion = 3
+const postgresSchemaVersion = 4
 const postgresOperationTimeout = 10 * time.Second
 
 type PostgresStore struct {
@@ -137,6 +137,15 @@ CREATE INDEX IF NOT EXISTS idx_pg_network_endpoints_server ON network_endpoints(
 		}
 		if _, err := tx.Exec(ctx, `INSERT INTO schema_migrations(version) VALUES (3)`); err != nil {
 			return fmt.Errorf("record postgres migration v3: %w", err)
+		}
+		version = 3
+	}
+	if version < 4 {
+		if err := migratePostgresDiscovery(ctx, tx); err != nil {
+			return fmt.Errorf("apply postgres migration v4: %w", err)
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO schema_migrations(version) VALUES (4)`); err != nil {
+			return fmt.Errorf("record postgres migration v4: %w", err)
 		}
 	}
 	return tx.Commit(ctx)
