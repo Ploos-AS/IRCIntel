@@ -106,12 +106,12 @@ func storageConfigFromEnv() (storageConfig, error) {
 	return cfg, nil
 }
 
-func openStorage(cfg storageConfig) (*core.SQLiteStore, error) {
+func openStorage(cfg storageConfig) (core.RuntimeStore, error) {
 	switch cfg.Backend {
 	case "sqlite":
 		return core.OpenSQLiteStore(cfg.SQLitePath)
 	case "postgres":
-		return nil, errors.New("postgres storage backend is reserved but not implemented yet")
+		return core.OpenPostgresStore(cfg.DatabaseURL)
 	default:
 		return nil, fmt.Errorf("unsupported storage backend %q", cfg.Backend)
 	}
