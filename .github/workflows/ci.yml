@@ -38,6 +38,113 @@ jobs:
       - run: go vet ./...
       - run: go build ./cmd/ircintel
 
+  postgres-runtime:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: ircintel
+          POSTGRES_PASSWORD: ircintel
+          POSTGRES_DB: ircintel_runtime
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ircintel -d ircintel_runtime"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      IRCINTEL_STORAGE_BACKEND: postgres
+      IRCINTEL_DATABASE_URL: postgres://ircintel:ircintel@127.0.0.1:5432/ircintel_runtime?sslmode=disable
+      IRCINTEL_CORE_TOKEN: runtime-test-token
+      IRCINTEL_LISTEN: 127.0.0.1:18081
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+      - name: Build Core
+        run: go build -o /tmp/ircintel ./cmd/ircintel
+      - name: Start Core on PostgreSQL
+        run: |
+          /tmp/ircintel > /tmp/ircintel.log 2>&1 &
+          echo $! > /tmp/ircintel.pid
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:18081/healthz | grep -qx 'ok'; then
+              exit 0
+            fi
+            if [ "$attempt" -eq 30 ]; then
+              cat /tmp/ircintel.log
+              exit 1
+            fi
+            sleep 1
+          done
+      - name: Exercise PostgreSQL runtime APIs
+        run: |
+          auth='Authorization: Bearer runtime-test-token'
+          curl --fail --silent -X POST -H "$auth" -H 'Content-Type: application/json' \
+            --data '{"id":"runtime-net","name":"Runtime Network"}' \
+            http://127.0.0.1:18081/api/v1/registry/networks
+          curl --fail --silent -X POST -H "$auth" -H 'Content-Type: application/json' \
+            --data '{"id":"runtime-server","network_id":"runtime-net","name":"Runtime Server"}' \
+            http://127.0.0.1:18081/api/v1/registry/servers
+          curl --fail --silent -X POST -H "$auth" -H 'Content-Type: application/json' \
+            --data '{"id":"runtime-endpoint","server_id":"runtime-server","host":"irc.runtime.example","port":"6697","tls":true}' \
+            http://127.0.0.1:18081/api/v1/registry/endpoints
+          curl --fail --silent -X POST -H "$auth" -H 'Content-Type: application/json' \
+            --data '{"agent_id":"runtime-agent","observed_at":"2026-09-10T12:00:00Z","endpoint":{"host":"irc.runtime.example","port":"6697","tls":true},"result":{"reachable":true}}' \
+            http://127.0.0.1:18081/api/v1/observations
+          curl --fail --silent -H "$auth" http://127.0.0.1:18081/api/v1/registry > /tmp/registry.json
+          curl --fail --silent -H "$auth" 'http://127.0.0.1:18081/api/v1/observations?host=irc.runtime.example&limit=10' > /tmp/observations.json
+          curl --fail --silent -H "$auth" http://127.0.0.1:18081/api/v1/endpoints/status > /tmp/status.json
+          python3 - <<'PY'
+          import json
+          registry = json.load(open('/tmp/registry.json'))
+          observations = json.load(open('/tmp/observations.json'))
+          status = json.load(open('/tmp/status.json'))
+          assert any(n['id'] == 'runtime-net' for n in registry['networks'])
+          assert any(e['id'] == 'runtime-endpoint' for e in registry['endpoints'])
+          assert len(observations['observations']) == 1
+          assert observations['observations'][0]['agent_id'] == 'runtime-agent'
+          assert any(e['host'] == 'irc.runtime.example' for e in status['endpoints'])
+          PY
+      - name: Restart Core and verify persistence
+        run: |
+          kill "$(cat /tmp/ircintel.pid)"
+          for attempt in $(seq 1 20); do
+            if ! kill -0 "$(cat /tmp/ircintel.pid)" 2>/dev/null; then break; fi
+            sleep 1
+          done
+          /tmp/ircintel > /tmp/ircintel-restart.log 2>&1 &
+          echo $! > /tmp/ircintel.pid
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:18081/healthz | grep -qx 'ok'; then break; fi
+            if [ "$attempt" -eq 30 ]; then cat /tmp/ircintel-restart.log; exit 1; fi
+            sleep 1
+          done
+          auth='Authorization: Bearer runtime-test-token'
+          curl --fail --silent -H "$auth" http://127.0.0.1:18081/api/v1/registry > /tmp/registry-after-restart.json
+          curl --fail --silent -H "$auth" 'http://127.0.0.1:18081/api/v1/observations?host=irc.runtime.example&limit=10' > /tmp/observations-after-restart.json
+          python3 - <<'PY'
+          import json
+          registry = json.load(open('/tmp/registry-after-restart.json'))
+          observations = json.load(open('/tmp/observations-after-restart.json'))
+          assert any(n['id'] == 'runtime-net' for n in registry['networks'])
+          assert any(e['id'] == 'runtime-endpoint' for e in registry['endpoints'])
+          assert len(observations['observations']) == 1
+          assert observations['observations'][0]['agent_id'] == 'runtime-agent'
+          PY
+      - name: Show Core logs on failure
+        if: failure()
+        run: |
+          cat /tmp/ircintel.log 2>/dev/null || true
+          cat /tmp/ircintel-restart.log 2>/dev/null || true
+      - name: Stop Core
+        if: always()
+        run: |
+          if [ -f /tmp/ircintel.pid ]; then kill "$(cat /tmp/ircintel.pid)" 2>/dev/null || true; fi
+
   oci-runtime:
     runs-on: ubuntu-latest
     steps:
