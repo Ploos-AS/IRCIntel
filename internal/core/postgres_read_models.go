@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 )
@@ -23,13 +24,15 @@ func (s *PostgresStore) NetworkIncidentStatsSnapshot(since, until time.Time) (Re
 
 	where := make([]string, 0, 2)
 	args := make([]any, 0, 2)
+	add := func(clause string, value any) {
+		args = append(args, value)
+		where = append(where, fmt.Sprintf(clause, len(args)))
+	}
 	if !since.IsZero() {
-		args = append(args, since.UTC())
-		where = append(where, "started_at >= $1")
+		add("started_at >= $%d", since.UTC())
 	}
 	if !until.IsZero() {
-		args = append(args, until.UTC())
-		where = append(where, "started_at <= $"+string(rune('0'+len(args))))
+		add("started_at <= $%d", until.UTC())
 	}
 	statement := "SELECT payload_json FROM network_incident_records"
 	if len(where) > 0 {
