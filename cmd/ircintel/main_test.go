@@ -88,9 +88,9 @@ func TestStorageConfigRejectsUnknownBackend(t *testing.T) {
 	}
 }
 
-func TestOpenStorageFailsClosedForReservedPostgres(t *testing.T) {
-	_, err := openStorage(storageConfig{Backend: "postgres", DatabaseURL: "postgres://db/ircintel"})
-	if err == nil || !strings.Contains(err.Error(), "not implemented") {
-		t.Fatalf("err=%v", err)
+func TestOpenStoragePostgresFailsClosedOnBadConnection(t *testing.T) {
+	_, err := openStorage(storageConfig{Backend: "postgres", DatabaseURL: "://bad-url"})
+	if err == nil {
+		t.Fatal("expected invalid postgres connection to fail")
 	}
 }
