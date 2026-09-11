@@ -1,0 +1,104 @@
+name: PITR Readiness
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  postgres-pitr-readiness:
+    runs-on: ubuntu-latest
+    env:
+      PGPASSWORD: ircintel
+      IRCINTEL_DATABASE_URL: postgres://ircintel:ircintel@127.0.0.1:55432/ircintel_pitr?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install PostgreSQL 17 client
+        run: |
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc --fail --silent --show-error https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(. /etc/os-release && echo $VERSION_CODENAME)-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client-17
+          echo '/usr/lib/postgresql/17/bin' >> "$GITHUB_PATH"
+      - name: Start PostgreSQL 17 with WAL archiving
+        run: |
+          docker run -d --name ircintel-pitr \
+            -e POSTGRES_USER=ircintel \
+            -e POSTGRES_PASSWORD=ircintel \
+            -e POSTGRES_DB=ircintel_pitr \
+            -p 55432:5432 \
+            postgres:17 \
+            -c wal_level=replica \
+            -c archive_mode=on \
+            -c "archive_command=mkdir -p /var/lib/postgresql/data/wal-archive && test ! -f /var/lib/postgresql/data/wal-archive/%f && cp %p /var/lib/postgresql/data/wal-archive/%f" \
+            -c archive_timeout=60
+          for attempt in $(seq 1 30); do
+            if pg_isready -h 127.0.0.1 -p 55432 -U ircintel -d ircintel_pitr >/dev/null 2>&1; then
+              exit 0
+            fi
+            if [ "$attempt" -eq 30 ]; then
+              docker logs ircintel-pitr
+              exit 1
+            fi
+            sleep 1
+          done
+      - name: Verify fail-closed preflight contract
+        run: |
+          chmod +x ops/postgres/pitr-preflight.sh
+          output="$(ops/postgres/pitr-preflight.sh)"
+          printf '%s\n' "$output"
+          printf '%s\n' "$output" | grep -qx 'pitr_ready=true'
+          printf '%s\n' "$output" | grep -qx 'postgres_major=17'
+          printf '%s\n' "$output" | grep -qx 'wal_level=replica'
+          printf '%s\n' "$output" | grep -qx 'archive_mode=on'
+      - name: Prove WAL reaches archive destination
+        run: |
+          psql "$IRCINTEL_DATABASE_URL" -v ON_ERROR_STOP=1 <<'SQL'
+          CREATE TABLE pitr_qualification(id integer primary key, marker text not null);
+          INSERT INTO pitr_qualification VALUES (1, 'before-switch');
+          CHECKPOINT;
+          SELECT pg_switch_wal();
+          SQL
+          for attempt in $(seq 1 30); do
+            archived="$(docker exec ircintel-pitr sh -c 'find /var/lib/postgresql/data/wal-archive -maxdepth 1 -type f 2>/dev/null | wc -l')"
+            if [ "$archived" -ge 1 ]; then
+              docker exec ircintel-pitr sh -c 'ls -l /var/lib/postgresql/data/wal-archive'
+              exit 0
+            fi
+            if [ "$attempt" -eq 30 ]; then
+              docker logs ircintel-pitr
+              exit 1
+            fi
+            sleep 1
+          done
+      - name: Verify unsafe configurations are rejected
+        run: |
+          docker rm -f ircintel-pitr
+          docker run -d --name ircintel-pitr-default \
+            -e POSTGRES_USER=ircintel \
+            -e POSTGRES_PASSWORD=ircintel \
+            -e POSTGRES_DB=ircintel_pitr \
+            -p 55432:5432 \
+            postgres:17
+          for attempt in $(seq 1 30); do
+            if pg_isready -h 127.0.0.1 -p 55432 -U ircintel -d ircintel_pitr >/dev/null 2>&1; then
+              break
+            fi
+            sleep 1
+          done
+          if ops/postgres/pitr-preflight.sh; then
+            echo 'expected default PostgreSQL configuration to fail PITR preflight' >&2
+            exit 1
+          fi
+      - name: Show PostgreSQL logs on failure
+        if: failure()
+        run: |
+          docker logs ircintel-pitr 2>/dev/null || true
+          docker logs ircintel-pitr-default 2>/dev/null || true
+      - name: Stop PostgreSQL
+        if: always()
+        run: |
+          docker rm -f ircintel-pitr ircintel-pitr-default 2>/dev/null || true
