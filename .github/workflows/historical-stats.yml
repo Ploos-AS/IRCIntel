@@ -45,27 +45,48 @@ jobs:
             if [ "$attempt" -eq 30 ]; then cat /tmp/ircintel-history.log; exit 1; fi
             sleep 1
           done
-      - name: Seed historical observations
+      - name: Seed registry and historical observations
         run: |
           auth='Authorization: Bearer history-test-token'
+          for payload in \
+            '{"id":"history-net","name":"History Network"}' \
+            '{"id":"other-net","name":"Other Network"}'; do
+            curl --fail --silent -X POST -H "$auth" -H 'Content-Type: application/json' --data "$payload" \
+              http://127.0.0.1:18083/api/v1/registry/networks
+          done
+          curl --fail --silent -X POST -H "$auth" -H 'Content-Type: application/json' \
+            --data '{"id":"history-server","network_id":"history-net","name":"History Server"}' \
+            http://127.0.0.1:18083/api/v1/registry/servers
+          curl --fail --silent -X POST -H "$auth" -H 'Content-Type: application/json' \
+            --data '{"id":"other-server","network_id":"other-net","name":"Other Server"}' \
+            http://127.0.0.1:18083/api/v1/registry/servers
+          curl --fail --silent -X POST -H "$auth" -H 'Content-Type: application/json' \
+            --data '{"id":"history-endpoint","server_id":"history-server","host":"irc.history.example","port":"6697","tls":true}' \
+            http://127.0.0.1:18083/api/v1/registry/endpoints
+          curl --fail --silent -X POST -H "$auth" -H 'Content-Type: application/json' \
+            --data '{"id":"other-endpoint","server_id":"other-server","host":"irc.other.example","port":"6697","tls":true}' \
+            http://127.0.0.1:18083/api/v1/registry/endpoints
           now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           old=$(date -u -d '2 hours ago' +%Y-%m-%dT%H:%M:%SZ)
           for payload in \
             "{\"agent_id\":\"history-a\",\"observed_at\":\"$old\",\"endpoint\":{\"host\":\"irc.history.example\",\"port\":\"6697\",\"tls\":true},\"result\":{\"reachable\":true,\"dual_stack_ok\":true}}" \
             "{\"agent_id\":\"history-b\",\"observed_at\":\"$old\",\"endpoint\":{\"host\":\"irc.history.example\",\"port\":\"6697\",\"tls\":true},\"result\":{\"reachable\":false,\"dual_stack_ok\":false}}" \
-            "{\"agent_id\":\"history-a\",\"observed_at\":\"$now\",\"endpoint\":{\"host\":\"irc.history.example\",\"port\":\"6697\",\"tls\":true},\"result\":{\"reachable\":true,\"dual_stack_ok\":false}}"; do
+            "{\"agent_id\":\"history-a\",\"observed_at\":\"$now\",\"endpoint\":{\"host\":\"irc.history.example\",\"port\":\"6697\",\"tls\":true},\"result\":{\"reachable\":true,\"dual_stack_ok\":false}}" \
+            "{\"agent_id\":\"other-a\",\"observed_at\":\"$old\",\"endpoint\":{\"host\":\"irc.other.example\",\"port\":\"6697\",\"tls\":true},\"result\":{\"reachable\":true,\"dual_stack_ok\":true}}"; do
             curl --fail --silent -X POST -H "$auth" -H 'Content-Type: application/json' --data "$payload" \
               http://127.0.0.1:18083/api/v1/observations
           done
-      - name: Verify historical API
+      - name: Verify historical APIs
         run: |
           auth='Authorization: Bearer history-test-token'
           curl --fail --silent -H "$auth" 'http://127.0.0.1:18083/api/v1/history/observations?period=24h&host=irc.history.example' > /tmp/history-24h.json
           curl --fail --silent -H "$auth" 'http://127.0.0.1:18083/api/v1/history/observations?period=all&host=irc.history.example' > /tmp/history-all.json
+          curl --fail --silent -H "$auth" 'http://127.0.0.1:18083/api/v1/history/networks?network_id=history-net&period=24h' > /tmp/network-history.json
           python3 - <<'PY'
           import json
           h24 = json.load(open('/tmp/history-24h.json'))
           hall = json.load(open('/tmp/history-all.json'))
+          net = json.load(open('/tmp/network-history.json'))
           assert h24['period'] == '24h'
           assert h24['granularity'] == 'hour'
           assert h24['host'] == 'irc.history.example'
@@ -73,6 +94,10 @@ jobs:
           assert hall['period'] == 'all'
           assert hall['granularity'] == 'day'
           assert sum(p['observation_count'] for p in hall['points']) == 3
+          assert net['network_id'] == 'history-net'
+          assert net['network_name'] == 'History Network'
+          assert net['granularity'] == 'hour'
+          assert sum(p['observation_count'] for p in net['points']) == 3
           PY
       - name: Show logs on failure
         if: failure()
