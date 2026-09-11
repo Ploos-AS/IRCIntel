@@ -43,20 +43,42 @@ func (s *PostgresStore) UpsertNetworkServer(server NetworkServer) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), postgresRegistryTimeout)
 	defer cancel()
+	tx, err := s.pool.Begin(ctx)
+	if err != nil { return err }
+	defer tx.Rollback(ctx)
+	if err := ensurePostgresNetworkOwnershipTx(ctx, tx); err != nil { return err }
+
 	var exists bool
-	if err := s.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM networks WHERE id = $1)`, server.NetworkID).Scan(&exists); err != nil {
+	if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM networks WHERE id = $1)`, server.NetworkID).Scan(&exists); err != nil {
 		return err
 	}
 	if !exists {
 		return ErrRegistryNetworkNotFound
 	}
-	_, err := s.pool.Exec(ctx, `
+	changedAt := time.Now().UTC()
+	if _, err := tx.Exec(ctx, `
 INSERT INTO network_servers (id, network_id, name)
 VALUES ($1, $2, $3)
 ON CONFLICT(id) DO UPDATE SET
     network_id = excluded.network_id,
-    name = excluded.name`, server.ID, server.NetworkID, server.Name)
-	return err
+    name = excluded.name`, server.ID, server.NetworkID, server.Name); err != nil {
+		return err
+	}
+
+	rows, err := tx.Query(ctx, `SELECT id FROM network_endpoints WHERE server_id = $1 ORDER BY id`, server.ID)
+	if err != nil { return err }
+	endpointIDs := make([]string, 0)
+	for rows.Next() {
+		var endpointID string
+		if err := rows.Scan(&endpointID); err != nil { rows.Close(); return err }
+		endpointIDs = append(endpointIDs, endpointID)
+	}
+	if err := rows.Err(); err != nil { rows.Close(); return err }
+	rows.Close()
+	for _, endpointID := range endpointIDs {
+		if err := syncPostgresEndpointOwnershipTx(ctx, tx, endpointID, changedAt); err != nil { return err }
+	}
+	return tx.Commit(ctx)
 }
 
 func (s *PostgresStore) UpsertNetworkEndpoint(endpoint NetworkEndpoint) error {
@@ -72,22 +94,31 @@ func (s *PostgresStore) UpsertNetworkEndpoint(endpoint NetworkEndpoint) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), postgresRegistryTimeout)
 	defer cancel()
+	tx, err := s.pool.Begin(ctx)
+	if err != nil { return err }
+	defer tx.Rollback(ctx)
+	if err := ensurePostgresNetworkOwnershipTx(ctx, tx); err != nil { return err }
+
 	var exists bool
-	if err := s.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM network_servers WHERE id = $1)`, endpoint.ServerID).Scan(&exists); err != nil {
+	if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM network_servers WHERE id = $1)`, endpoint.ServerID).Scan(&exists); err != nil {
 		return err
 	}
 	if !exists {
 		return ErrRegistryServerNotFound
 	}
-	_, err := s.pool.Exec(ctx, `
+	changedAt := time.Now().UTC()
+	if _, err := tx.Exec(ctx, `
 INSERT INTO network_endpoints (id, server_id, host, port, tls)
 VALUES ($1, $2, $3, $4, $5)
 ON CONFLICT(id) DO UPDATE SET
     server_id = excluded.server_id,
     host = excluded.host,
     port = excluded.port,
-    tls = excluded.tls`, endpoint.ID, endpoint.ServerID, endpoint.Host, endpoint.Port, endpoint.TLS)
-	return err
+    tls = excluded.tls`, endpoint.ID, endpoint.ServerID, endpoint.Host, endpoint.Port, endpoint.TLS); err != nil {
+		return err
+	}
+	if err := syncPostgresEndpointOwnershipTx(ctx, tx, endpoint.ID, changedAt); err != nil { return err }
+	return tx.Commit(ctx)
 }
 
 func (s *PostgresStore) RegistrySnapshot() (RegistrySnapshot, error) {
