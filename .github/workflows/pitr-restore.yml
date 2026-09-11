@@ -1,0 +1,86 @@
+name: PITR Restore
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  postgres-pitr-restore:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Qualify PostgreSQL 17 point-in-time recovery
+        run: |
+          set -euo pipefail
+          docker network create ircintel-pitr
+          mkdir -p /tmp/ircintel-pitr/archive /tmp/ircintel-pitr/base
+          chmod 0777 /tmp/ircintel-pitr/archive /tmp/ircintel-pitr/base
+
+          docker run -d --name pitr-source --network ircintel-pitr \
+            -e POSTGRES_USER=ircintel -e POSTGRES_PASSWORD=ircintel -e POSTGRES_DB=ircintel \
+            -v /tmp/ircintel-pitr/archive:/archive \
+            postgres:17 \
+            -c wal_level=replica \
+            -c archive_mode=on \
+            -c "archive_command=test ! -f /archive/%f && cp %p /archive/%f"
+
+          for attempt in $(seq 1 30); do
+            docker exec pitr-source pg_isready -U ircintel -d ircintel >/dev/null 2>&1 && break
+            test "$attempt" -lt 30
+            sleep 1
+          done
+
+          docker exec pitr-source psql -U ircintel -d ircintel -v ON_ERROR_STOP=1 -c \
+            "CREATE TABLE pitr_qualification(id integer PRIMARY KEY, marker text NOT NULL); INSERT INTO pitr_qualification VALUES (1, 'base');"
+
+          docker exec pitr-source pg_basebackup -U ircintel -D /tmp/basebackup -Fp -Xs -P
+          docker cp pitr-source:/tmp/basebackup/. /tmp/ircintel-pitr/base/
+
+          docker exec pitr-source psql -U ircintel -d ircintel -v ON_ERROR_STOP=1 -c \
+            "INSERT INTO pitr_qualification VALUES (2, 'before-target');"
+          target="$(docker exec pitr-source psql -U ircintel -d ircintel -Atc "SELECT clock_timestamp() + interval '2 seconds'")"
+          sleep 3
+          docker exec pitr-source psql -U ircintel -d ircintel -v ON_ERROR_STOP=1 -c \
+            "INSERT INTO pitr_qualification VALUES (3, 'after-target');"
+          docker exec pitr-source psql -U ircintel -d ircintel -c 'SELECT pg_switch_wal();'
+
+          for attempt in $(seq 1 30); do
+            count="$(find /tmp/ircintel-pitr/archive -maxdepth 1 -type f | wc -l)"
+            [ "$count" -gt 0 ] && break
+            test "$attempt" -lt 30
+            sleep 1
+          done
+
+          docker stop pitr-source
+          chmod -R a+rX /tmp/ircintel-pitr/base /tmp/ircintel-pitr/archive
+          cat >> /tmp/ircintel-pitr/base/postgresql.auto.conf <<EOF
+          restore_command = 'cp /archive/%f %p'
+          recovery_target_time = '$target'
+          recovery_target_action = 'promote'
+          EOF
+          touch /tmp/ircintel-pitr/base/recovery.signal
+          chmod 0700 /tmp/ircintel-pitr/base
+
+          docker run -d --name pitr-restored --network ircintel-pitr \
+            -v /tmp/ircintel-pitr/base:/var/lib/postgresql/data \
+            -v /tmp/ircintel-pitr/archive:/archive:ro \
+            postgres:17
+
+          for attempt in $(seq 1 60); do
+            docker exec pitr-restored pg_isready -U ircintel -d ircintel >/dev/null 2>&1 && break
+            if [ "$attempt" -eq 60 ]; then docker logs pitr-restored; exit 1; fi
+            sleep 1
+          done
+
+          rows="$(docker exec pitr-restored psql -U ircintel -d ircintel -Atc "SELECT string_agg(id || ':' || marker, ',' ORDER BY id) FROM pitr_qualification")"
+          printf 'recovered=<%s> target=<%s>\n' "$rows" "$target"
+          test "$rows" = '1:base,2:before-target'
+          docker exec pitr-restored psql -U ircintel -d ircintel -Atc 'SELECT pg_is_in_recovery()' | grep -qx 'f'
+      - name: Show recovery logs on failure
+        if: failure()
+        run: |
+          docker logs pitr-source 2>/dev/null || true
+          docker logs pitr-restored 2>/dev/null || true
