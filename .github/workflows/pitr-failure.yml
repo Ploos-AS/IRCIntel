@@ -1,0 +1,120 @@
+name: PITR Failure Path
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  postgres-pitr-missing-wal:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Qualify PostgreSQL 17 missing-WAL recovery failure
+        run: |
+          set -euo pipefail
+          docker network create ircintel-pitr-failure
+          mkdir -p /tmp/ircintel-pitr-failure/archive /tmp/ircintel-pitr-failure/base
+          chmod 0777 /tmp/ircintel-pitr-failure/archive /tmp/ircintel-pitr-failure/base
+
+          docker run -d --name pitr-failure-source --network ircintel-pitr-failure \
+            -e POSTGRES_USER=ircintel -e POSTGRES_PASSWORD=ircintel -e POSTGRES_DB=ircintel \
+            -v /tmp/ircintel-pitr-failure/archive:/archive \
+            postgres:17 \
+            -c wal_level=replica \
+            -c archive_mode=on \
+            -c "archive_command=test ! -f /archive/%f && cp %p /archive/%f"
+
+          for attempt in $(seq 1 30); do
+            if docker exec pitr-failure-source psql -U ircintel -d ircintel -Atc 'SELECT 1' 2>/dev/null | grep -qx '1'; then
+              break
+            fi
+            if [ "$attempt" -eq 30 ]; then docker logs pitr-failure-source; exit 1; fi
+            sleep 1
+          done
+
+          docker exec pitr-failure-source psql -U ircintel -d ircintel -v ON_ERROR_STOP=1 -c \
+            "CREATE TABLE pitr_failure_qualification(id integer PRIMARY KEY, marker text NOT NULL); INSERT INTO pitr_failure_qualification VALUES (1, 'base');"
+
+          docker exec pitr-failure-source pg_basebackup -U ircintel -D /tmp/basebackup -Fp -Xs -P
+          docker cp pitr-failure-source:/tmp/basebackup/. /tmp/ircintel-pitr-failure/base/
+
+          docker exec pitr-failure-source psql -U ircintel -d ircintel -v ON_ERROR_STOP=1 -c \
+            "INSERT INTO pitr_failure_qualification VALUES (2, 'requires-archive');"
+          target="$(docker exec pitr-failure-source psql -U ircintel -d ircintel -Atc "SELECT clock_timestamp() + interval '2 seconds'")"
+          sleep 3
+          docker exec pitr-failure-source psql -U ircintel -d ircintel -v ON_ERROR_STOP=1 -c \
+            "INSERT INTO pitr_failure_qualification VALUES (3, 'after-target');"
+          docker exec pitr-failure-source psql -U ircintel -d ircintel -c 'SELECT pg_switch_wal();'
+
+          for attempt in $(seq 1 30); do
+            count="$(find /tmp/ircintel-pitr-failure/archive -maxdepth 1 -type f | wc -l)"
+            [ "$count" -gt 0 ] && break
+            if [ "$attempt" -eq 30 ]; then
+              echo 'WAL archive did not receive any files'
+              exit 1
+            fi
+            sleep 1
+          done
+
+          docker stop pitr-failure-source
+
+          # M4.26 deliberately removes the archived WAL needed to reach the
+          # configured recovery target. The recovery server must not become a
+          # healthy promoted database when the archive is incomplete.
+          rm -f /tmp/ircintel-pitr-failure/archive/*
+          test -z "$(find /tmp/ircintel-pitr-failure/archive -maxdepth 1 -type f -print -quit)"
+
+          sudo chown -R "$(id -u):$(id -g)" /tmp/ircintel-pitr-failure/base
+          cat >> /tmp/ircintel-pitr-failure/base/postgresql.auto.conf <<EOF
+          restore_command = 'cp /archive/%f %p'
+          recovery_target_time = '$target'
+          recovery_target_action = 'promote'
+          EOF
+          touch /tmp/ircintel-pitr-failure/base/recovery.signal
+          chmod 0700 /tmp/ircintel-pitr-failure/base
+          sudo chown -R 999:999 /tmp/ircintel-pitr-failure/base
+
+          docker run -d --name pitr-failure-restored --network ircintel-pitr-failure \
+            -v /tmp/ircintel-pitr-failure/base:/var/lib/postgresql/data \
+            -v /tmp/ircintel-pitr-failure/archive:/archive:ro \
+            postgres:17
+
+          became_ready=false
+          for attempt in $(seq 1 20); do
+            if docker exec pitr-failure-restored pg_isready -U ircintel -d ircintel >/dev/null 2>&1; then
+              became_ready=true
+              break
+            fi
+            running="$(docker inspect -f '{{.State.Running}}' pitr-failure-restored)"
+            [ "$running" = 'false' ] && break
+            sleep 1
+          done
+
+          if [ "$became_ready" = 'true' ]; then
+            echo 'ERROR: recovery unexpectedly became ready without the required WAL archive'
+            docker logs pitr-failure-restored
+            exit 1
+          fi
+
+          for attempt in $(seq 1 20); do
+            running="$(docker inspect -f '{{.State.Running}}' pitr-failure-restored)"
+            [ "$running" = 'false' ] && break
+            if [ "$attempt" -eq 20 ]; then
+              echo 'ERROR: recovery remained running instead of failing on missing WAL'
+              docker logs pitr-failure-restored
+              exit 1
+            fi
+            sleep 1
+          done
+
+          logs="$(docker logs pitr-failure-restored 2>&1 || true)"
+          printf '%s\n' "$logs"
+          printf '%s\n' "$logs" | grep -Eiq 'recovery ended before configured recovery target|could not restore file|No such file or directory'
+      - name: Show recovery logs on failure
+        if: failure()
+        run: |
+          docker logs pitr-failure-source 2>/dev/null || true
+          docker logs pitr-failure-restored 2>/dev/null || true
