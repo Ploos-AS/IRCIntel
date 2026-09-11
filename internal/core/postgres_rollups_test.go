@@ -63,6 +63,67 @@ func TestPostgresObservationRollupsAndRetention(t *testing.T) {
 	if retained != 3 { t.Fatalf("retained rollup count=%d want=3", retained) }
 }
 
+func TestCompleteBucketRangeExpandsNonAlignedBounds(t *testing.T) {
+	since := time.Date(2026, 9, 11, 10, 17, 0, 0, time.FixedZone("offset", 2*60*60))
+	until := time.Date(2026, 9, 11, 12, 43, 0, 0, time.FixedZone("offset", 2*60*60))
+
+	hourStart, hourEnd := completeBucketRange(since, until, "hour")
+	if want := time.Date(2026, 9, 11, 8, 0, 0, 0, time.UTC); !hourStart.Equal(want) { t.Fatalf("hour start=%s want=%s", hourStart, want) }
+	if want := time.Date(2026, 9, 11, 11, 0, 0, 0, time.UTC); !hourEnd.Equal(want) { t.Fatalf("hour end=%s want=%s", hourEnd, want) }
+
+	dayStart, dayEnd := completeBucketRange(since, until, "day")
+	if want := time.Date(2026, 9, 11, 0, 0, 0, 0, time.UTC); !dayStart.Equal(want) { t.Fatalf("day start=%s want=%s", dayStart, want) }
+	if want := time.Date(2026, 9, 12, 0, 0, 0, 0, time.UTC); !dayEnd.Equal(want) { t.Fatalf("day end=%s want=%s", dayEnd, want) }
+}
+
+func TestPostgresRollupRebuildKeepsCompleteBoundaryBucket(t *testing.T) {
+	store := openTestPostgresStore(t)
+	ctx := context.Background()
+	if _, err := store.pool.Exec(ctx, `TRUNCATE observation_rollups_hourly, observation_rollups_daily, observations RESTART IDENTITY`); err != nil { t.Fatal(err) }
+
+	bucket := time.Date(2026, 9, 11, 10, 0, 0, 0, time.UTC)
+	items := []agent.Observation{
+		{AgentID: "before", ObservedAt: bucket.Add(10 * time.Minute), Endpoint: agent.Endpoint{Host: "boundary.example", Port: "6697", TLS: true}, Result: probe.EndpointResult{Reachable: true}},
+		{AgentID: "after", ObservedAt: bucket.Add(50 * time.Minute), Endpoint: agent.Endpoint{Host: "boundary.example", Port: "6697", TLS: true}, Result: probe.EndpointResult{Reachable: false}},
+	}
+	for _, item := range items { if err := store.Store(item); err != nil { t.Fatal(err) } }
+
+	// Simulate a damaged rollup, then rebuild only up to a non-aligned cutoff
+	// inside the same hour. The whole 10:00 UTC bucket must be reconstructed.
+	if _, err := store.pool.Exec(ctx, `UPDATE observation_rollups_hourly SET observation_count=99 WHERE endpoint_host='boundary.example'`); err != nil { t.Fatal(err) }
+	cutoff := bucket.Add(30 * time.Minute)
+	if err := store.RebuildObservationRollups(time.Time{}, cutoff); err != nil { t.Fatal(err) }
+
+	rollups, err := store.ListObservationRollups(ObservationRollupQuery{Granularity: "hour", Host: "boundary.example", Limit: 10})
+	if err != nil { t.Fatal(err) }
+	if len(rollups) != 1 { t.Fatalf("rollups=%d want=1", len(rollups)) }
+	if rollups[0].ObservationCount != 2 || rollups[0].ReachableCount != 1 { t.Fatalf("boundary rollup=%+v", rollups[0]) }
+
+	deleted, err := store.PruneObservationsBefore(cutoff)
+	if err != nil { t.Fatal(err) }
+	if deleted != 1 { t.Fatalf("deleted=%d want=1", deleted) }
+	rollups, err = store.ListObservationRollups(ObservationRollupQuery{Granularity: "hour", Host: "boundary.example", Limit: 10})
+	if err != nil { t.Fatal(err) }
+	if len(rollups) != 1 || rollups[0].ObservationCount != 2 { t.Fatalf("retained boundary rollup=%+v", rollups) }
+}
+
+func TestPostgresRollupBucketingIgnoresSessionTimezone(t *testing.T) {
+	store := openTestPostgresStore(t)
+	ctx := context.Background()
+	if _, err := store.pool.Exec(ctx, `TRUNCATE observation_rollups_hourly, observation_rollups_daily, observations RESTART IDENTITY`); err != nil { t.Fatal(err) }
+
+	tx, err := store.pool.Begin(ctx)
+	if err != nil { t.Fatal(err) }
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `SET LOCAL TIME ZONE 'Pacific/Honolulu'`); err != nil { t.Fatal(err) }
+	observedAt := time.Date(2026, 9, 11, 0, 30, 0, 0, time.UTC)
+	if err := refreshPostgresRollupsForObservationTx(ctx, tx, observedAt, "utc.example", "6697", true, true, false); err != nil { t.Fatal(err) }
+	var bucketStart time.Time
+	if err := tx.QueryRow(ctx, `SELECT bucket_start FROM observation_rollups_hourly WHERE endpoint_host='utc.example'`).Scan(&bucketStart); err != nil { t.Fatal(err) }
+	want := time.Date(2026, 9, 11, 0, 0, 0, 0, time.UTC)
+	if !bucketStart.UTC().Equal(want) { t.Fatalf("bucket=%s want=%s", bucketStart.UTC(), want) }
+}
+
 func TestPostgresRollupQueryValidation(t *testing.T) {
 	store := openTestPostgresStore(t)
 	if _, err := store.ListObservationRollups(ObservationRollupQuery{Granularity: "week", Limit: 10}); err == nil { t.Fatal("expected granularity error") }
