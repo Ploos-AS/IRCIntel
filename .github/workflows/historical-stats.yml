@@ -68,7 +68,10 @@ jobs:
             http://127.0.0.1:18083/api/v1/registry/endpoints
           now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           old=$(date -u -d '2 hours ago' +%Y-%m-%dT%H:%M:%SZ)
+          previous=$(date -u -d '30 hours ago' +%Y-%m-%dT%H:%M:%SZ)
           for payload in \
+            "{\"agent_id\":\"history-prev\",\"observed_at\":\"$previous\",\"endpoint\":{\"host\":\"irc.history.example\",\"port\":\"6697\",\"tls\":true},\"result\":{\"reachable\":true,\"dual_stack_ok\":false}}" \
+            "{\"agent_id\":\"other-prev\",\"observed_at\":\"$previous\",\"endpoint\":{\"host\":\"irc.other.example\",\"port\":\"6697\",\"tls\":true},\"result\":{\"reachable\":false,\"dual_stack_ok\":false}}" \
             "{\"agent_id\":\"history-a\",\"observed_at\":\"$old\",\"endpoint\":{\"host\":\"irc.history.example\",\"port\":\"6697\",\"tls\":true},\"result\":{\"reachable\":true,\"dual_stack_ok\":true}}" \
             "{\"agent_id\":\"history-b\",\"observed_at\":\"$old\",\"endpoint\":{\"host\":\"irc.history.example\",\"port\":\"6697\",\"tls\":true},\"result\":{\"reachable\":false,\"dual_stack_ok\":false}}" \
             "{\"agent_id\":\"history-a\",\"observed_at\":\"$now\",\"endpoint\":{\"host\":\"irc.history.example\",\"port\":\"6697\",\"tls\":true},\"result\":{\"reachable\":true,\"dual_stack_ok\":false}}" \
@@ -82,22 +85,35 @@ jobs:
           curl --fail --silent -H "$auth" 'http://127.0.0.1:18083/api/v1/history/observations?period=24h&host=irc.history.example' > /tmp/history-24h.json
           curl --fail --silent -H "$auth" 'http://127.0.0.1:18083/api/v1/history/observations?period=all&host=irc.history.example' > /tmp/history-all.json
           curl --fail --silent -H "$auth" 'http://127.0.0.1:18083/api/v1/history/networks?network_id=history-net&period=24h' > /tmp/network-history.json
+          curl --fail --silent -H "$auth" 'http://127.0.0.1:18083/api/v1/history/networks/ranking?period=24h&limit=10' > /tmp/network-ranking.json
           python3 - <<'PY'
           import json
           h24 = json.load(open('/tmp/history-24h.json'))
           hall = json.load(open('/tmp/history-all.json'))
           net = json.load(open('/tmp/network-history.json'))
+          ranking = json.load(open('/tmp/network-ranking.json'))
           assert h24['period'] == '24h'
           assert h24['granularity'] == 'hour'
           assert h24['host'] == 'irc.history.example'
           assert sum(p['observation_count'] for p in h24['points']) == 3
           assert hall['period'] == 'all'
           assert hall['granularity'] == 'day'
-          assert sum(p['observation_count'] for p in hall['points']) == 3
+          assert sum(p['observation_count'] for p in hall['points']) == 4
           assert net['network_id'] == 'history-net'
           assert net['network_name'] == 'History Network'
           assert net['granularity'] == 'hour'
           assert sum(p['observation_count'] for p in net['points']) == 3
+          assert ranking['period'] == '24h'
+          assert ranking['granularity'] == 'hour'
+          assert [item['network_id'] for item in ranking['items']] == ['other-net', 'history-net']
+          assert ranking['items'][0]['rank'] == 1
+          assert ranking['items'][0]['reachable_percent'] == 100
+          assert ranking['items'][0]['previous_reachable_percent'] == 0
+          assert ranking['items'][0]['reachable_trend_points'] == 100
+          assert ranking['items'][1]['rank'] == 2
+          assert abs(ranking['items'][1]['reachable_percent'] - (200/3)) < 0.0001
+          assert ranking['items'][1]['previous_reachable_percent'] == 100
+          assert ranking['items'][1]['reachable_trend_points'] < 0
           PY
       - name: Show logs on failure
         if: failure()
