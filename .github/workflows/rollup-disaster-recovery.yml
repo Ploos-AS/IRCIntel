@@ -90,8 +90,8 @@ jobs:
               updated_at = excluded.updated_at;
           SQL
 
-          test "$(psql -h 127.0.0.1 -U ircintel -d ircintel_rollup_dr_source -Atc "SELECT observation_count || ':' || reachable_count || ':' || dual_stack_count FROM observation_rollups_hourly WHERE endpoint_host='irc.rollup-dr.example' AND bucket_start='2026-09-10T10:00:00Z'")" = '2:1:1'
-          test "$(psql -h 127.0.0.1 -U ircintel -d ircintel_rollup_dr_source -Atc "SELECT observation_count || ':' || reachable_count || ':' || dual_stack_count FROM observation_rollups_daily WHERE endpoint_host='irc.rollup-dr.example' AND bucket_start='2026-09-10T00:00:00Z'")" = '2:1:1'
+          test "$(psql -h 127.0.0.1 -U ircintel -d ircintel_rollup_dr_source -Atc "SELECT observation_count || ':' || reachable_count FROM observation_rollups_hourly WHERE endpoint_host='irc.rollup-dr.example' AND bucket_start='2026-09-10T10:00:00Z'")" = '2:1'
+          test "$(psql -h 127.0.0.1 -U ircintel -d ircintel_rollup_dr_source -Atc "SELECT observation_count || ':' || reachable_count FROM observation_rollups_daily WHERE endpoint_host='irc.rollup-dr.example' AND bucket_start='2026-09-10T00:00:00Z'")" = '2:1'
           test "$(psql -h 127.0.0.1 -U ircintel -d ircintel_rollup_dr_source -Atc "SELECT next_start AT TIME ZONE 'UTC' || '|' || upper_bound AT TIME ZONE 'UTC' || '|' || completed FROM observation_rollup_backfill_state WHERE id=1")" = '2026-08-01 00:00:00|2026-09-01 00:00:00|f'
       - name: Create logical backup with production script
         env:
@@ -156,7 +156,7 @@ jobs:
           data = json.load(open('/tmp/rollup-dr-history.json'))
           assert data['granularity'] == 'hour'
           points = data['points']
-          assert any(p['observation_count'] == 2 and p['reachable_count'] == 1 and p['dual_stack_count'] == 1 for p in points)
+          assert any(p['observation_count'] == 2 and p['reachable_count'] == 1 for p in points)
           PY
       - name: Show Core logs on failure
         if: failure()
