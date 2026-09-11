@@ -31,7 +31,7 @@ type ObservationRollupQuery struct {
 }
 
 func migratePostgresRollups(ctx context.Context, tx pgx.Tx) error {
-	if _, err := tx.Exec(ctx, `
+	_, err := tx.Exec(ctx, `
 CREATE TABLE IF NOT EXISTS observation_rollups_hourly (
     bucket_start TIMESTAMPTZ NOT NULL,
     endpoint_host TEXT NOT NULL,
@@ -59,10 +59,8 @@ CREATE TABLE IF NOT EXISTS observation_rollups_daily (
     PRIMARY KEY(bucket_start, endpoint_host, endpoint_port, endpoint_tls)
 );
 CREATE INDEX IF NOT EXISTS idx_pg_rollups_daily_endpoint_time
-    ON observation_rollups_daily(endpoint_host, endpoint_port, endpoint_tls, bucket_start DESC);`); err != nil {
-		return err
-	}
-	return rebuildPostgresRollupsTx(ctx, tx, time.Time{}, time.Time{})
+    ON observation_rollups_daily(endpoint_host, endpoint_port, endpoint_tls, bucket_start DESC);`)
+	return err
 }
 
 func refreshPostgresRollupsForObservationTx(ctx context.Context, tx pgx.Tx, observedAt time.Time, host, port string, tls, reachable, dualStack bool) error {
