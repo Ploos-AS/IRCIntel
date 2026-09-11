@@ -55,7 +55,12 @@ jobs:
           done
 
           docker stop pitr-source
-          chmod -R a+rX /tmp/ircintel-pitr/base /tmp/ircintel-pitr/archive
+
+          # The archived WAL files are owned by the postgres user in the source
+          # container. They only need to be readable by the recovery container;
+          # do not recursively chmod them from the host. Prepare the copied base
+          # backup separately, where the workflow must append recovery settings.
+          sudo chown -R "$(id -u):$(id -g)" /tmp/ircintel-pitr/base
           cat >> /tmp/ircintel-pitr/base/postgresql.auto.conf <<EOF
           restore_command = 'cp /archive/%f %p'
           recovery_target_time = '$target'
@@ -63,6 +68,7 @@ jobs:
           EOF
           touch /tmp/ircintel-pitr/base/recovery.signal
           chmod 0700 /tmp/ircintel-pitr/base
+          sudo chown -R 999:999 /tmp/ircintel-pitr/base
 
           docker run -d --name pitr-restored --network ircintel-pitr \
             -v /tmp/ircintel-pitr/base:/var/lib/postgresql/data \
