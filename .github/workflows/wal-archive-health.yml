@@ -1,0 +1,89 @@
+name: WAL Archive Health
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  postgres-wal-archive-health:
+    runs-on: ubuntu-latest
+    env:
+      PGPASSWORD: ircintel
+      IRCINTEL_DATABASE_URL: postgres://ircintel:ircintel@127.0.0.1:55433/ircintel_wal_health?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install PostgreSQL 17 client
+        run: |
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc --fail --silent --show-error https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(. /etc/os-release && echo $VERSION_CODENAME)-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client-17
+          echo '/usr/lib/postgresql/17/bin' >> "$GITHUB_PATH"
+      - name: Start PostgreSQL 17 with WAL archiving
+        run: |
+          docker run -d --name ircintel-wal-health \
+            -e POSTGRES_USER=ircintel \
+            -e POSTGRES_PASSWORD=ircintel \
+            -e POSTGRES_DB=ircintel_wal_health \
+            -p 55433:5432 \
+            postgres:17 \
+            -c wal_level=replica \
+            -c archive_mode=on \
+            -c "archive_command=mkdir -p /var/lib/postgresql/data/wal-archive && test ! -f /var/lib/postgresql/data/wal-archive/%f && cp %p /var/lib/postgresql/data/wal-archive/%f"
+          for attempt in $(seq 1 30); do
+            if psql "$IRCINTEL_DATABASE_URL" -X -A -t -v ON_ERROR_STOP=1 -c 'SELECT 1' | grep -qx 1; then exit 0; fi
+            if [ "$attempt" -eq 30 ]; then docker logs ircintel-wal-health; exit 1; fi
+            sleep 1
+          done
+      - name: Prove healthy archive is observable
+        run: |
+          chmod +x ops/postgres/wal-archive-health.sh
+          psql "$IRCINTEL_DATABASE_URL" -v ON_ERROR_STOP=1 -c 'CREATE TABLE wal_health_qualification(id integer primary key); INSERT INTO wal_health_qualification VALUES (1); CHECKPOINT; SELECT pg_switch_wal();'
+          for attempt in $(seq 1 30); do
+            if output="$(IRCINTEL_WAL_ARCHIVE_MAX_AGE_SECONDS=300 ops/postgres/wal-archive-health.sh 2>&1)"; then
+              printf '%s\n' "$output"
+              printf '%s\n' "$output" | grep -qx 'wal_archive_healthy=true'
+              printf '%s\n' "$output" | grep -qx 'wal_archive_reason=ok'
+              exit 0
+            fi
+            sleep 1
+          done
+          ops/postgres/wal-archive-health.sh
+      - name: Prove stale archive fails closed
+        run: |
+          sleep 2
+          if IRCINTEL_WAL_ARCHIVE_MAX_AGE_SECONDS=0 ops/postgres/wal-archive-health.sh > /tmp/stale.txt 2>&1; then
+            cat /tmp/stale.txt
+            echo 'expected stale WAL archive health check to fail' >&2
+            exit 1
+          fi
+          cat /tmp/stale.txt
+          grep -qx 'wal_archive_healthy=false' /tmp/stale.txt
+          grep -qx 'wal_archive_reason=archive_stale' /tmp/stale.txt
+      - name: Prove archive failures are observable
+        run: |
+          docker exec ircintel-wal-health sh -c "psql -U ircintel -d ircintel_wal_health -c \"ALTER SYSTEM SET archive_command = 'false';\" && psql -U ircintel -d ircintel_wal_health -c 'SELECT pg_reload_conf(); SELECT pg_switch_wal();'"
+          for attempt in $(seq 1 30); do
+            failed="$(psql "$IRCINTEL_DATABASE_URL" -X -A -t -v ON_ERROR_STOP=1 -c 'SELECT failed_count FROM pg_stat_archiver' | tr -d '[:space:]')"
+            if [ "${failed:-0}" -gt 0 ]; then break; fi
+            if [ "$attempt" -eq 30 ]; then docker logs ircintel-wal-health; exit 1; fi
+            sleep 1
+          done
+          if IRCINTEL_WAL_ARCHIVE_MAX_AGE_SECONDS=300 ops/postgres/wal-archive-health.sh > /tmp/failure.txt 2>&1; then
+            cat /tmp/failure.txt
+            echo 'expected archive failure health check to fail' >&2
+            exit 1
+          fi
+          cat /tmp/failure.txt
+          grep -qx 'wal_archive_healthy=false' /tmp/failure.txt
+          grep -qx 'wal_archive_reason=archive_failures' /tmp/failure.txt
+      - name: Show PostgreSQL logs on failure
+        if: failure()
+        run: docker logs ircintel-wal-health 2>/dev/null || true
+      - name: Stop PostgreSQL
+        if: always()
+        run: docker rm -f ircintel-wal-health 2>/dev/null || true
