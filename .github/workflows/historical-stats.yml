@@ -1,0 +1,83 @@
+name: Historical Stats
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  postgres-historical-stats:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: ircintel
+          POSTGRES_PASSWORD: ircintel
+          POSTGRES_DB: ircintel_history
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ircintel -d ircintel_history"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      IRCINTEL_STORAGE_BACKEND: postgres
+      IRCINTEL_DATABASE_URL: postgres://ircintel:ircintel@127.0.0.1:5432/ircintel_history?sslmode=disable
+      IRCINTEL_CORE_TOKEN: history-test-token
+      IRCINTEL_LISTEN: 127.0.0.1:18083
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+      - name: Build Core
+        run: go build -o /tmp/ircintel ./cmd/ircintel
+      - name: Start Core
+        run: |
+          /tmp/ircintel > /tmp/ircintel-history.log 2>&1 &
+          echo $! > /tmp/ircintel-history.pid
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:18083/healthz | grep -qx 'ok'; then exit 0; fi
+            if [ "$attempt" -eq 30 ]; then cat /tmp/ircintel-history.log; exit 1; fi
+            sleep 1
+          done
+      - name: Seed historical observations
+        run: |
+          auth='Authorization: Bearer history-test-token'
+          now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          old=$(date -u -d '2 hours ago' +%Y-%m-%dT%H:%M:%SZ)
+          for payload in \
+            "{\"agent_id\":\"history-a\",\"observed_at\":\"$old\",\"endpoint\":{\"host\":\"irc.history.example\",\"port\":\"6697\",\"tls\":true},\"result\":{\"reachable\":true,\"dual_stack_ok\":true}}" \
+            "{\"agent_id\":\"history-b\",\"observed_at\":\"$old\",\"endpoint\":{\"host\":\"irc.history.example\",\"port\":\"6697\",\"tls\":true},\"result\":{\"reachable\":false,\"dual_stack_ok\":false}}" \
+            "{\"agent_id\":\"history-a\",\"observed_at\":\"$now\",\"endpoint\":{\"host\":\"irc.history.example\",\"port\":\"6697\",\"tls\":true},\"result\":{\"reachable\":true,\"dual_stack_ok\":false}}"; do
+            curl --fail --silent -X POST -H "$auth" -H 'Content-Type: application/json' --data "$payload" \
+              http://127.0.0.1:18083/api/v1/observations
+          done
+      - name: Verify historical API
+        run: |
+          auth='Authorization: Bearer history-test-token'
+          curl --fail --silent -H "$auth" 'http://127.0.0.1:18083/api/v1/history/observations?period=24h&host=irc.history.example' > /tmp/history-24h.json
+          curl --fail --silent -H "$auth" 'http://127.0.0.1:18083/api/v1/history/observations?period=all&host=irc.history.example' > /tmp/history-all.json
+          python3 - <<'PY'
+          import json
+          h24 = json.load(open('/tmp/history-24h.json'))
+          hall = json.load(open('/tmp/history-all.json'))
+          assert h24['period'] == '24h'
+          assert h24['granularity'] == 'hour'
+          assert h24['host'] == 'irc.history.example'
+          assert sum(p['observation_count'] for p in h24['points']) == 3
+          assert hall['period'] == 'all'
+          assert hall['granularity'] == 'day'
+          assert sum(p['observation_count'] for p in hall['points']) == 3
+          PY
+      - name: Show logs on failure
+        if: failure()
+        run: cat /tmp/ircintel-history.log 2>/dev/null || true
+      - name: Stop Core
+        if: always()
+        run: |
+          if [ -f /tmp/ircintel-history.pid ]; then kill "$(cat /tmp/ircintel-history.pid)" 2>/dev/null || true; fi
