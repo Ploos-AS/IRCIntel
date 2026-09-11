@@ -28,7 +28,7 @@ DROP TABLE IF EXISTS observation_rollup_backfill_state`); err != nil {
 		if _, err := store.pool.Exec(ctx, `
 INSERT INTO observations(agent_id, observed_at, endpoint_host, endpoint_port, endpoint_tls, payload_json)
 VALUES ($1, $2, 'irc.backfill.example', '6697', true,
-        jsonb_build_object('result', jsonb_build_object('reachable', $3, 'dual_stack_ok', false)))`, row.agentID, row.at, row.reach); err != nil {
+        jsonb_build_object('result', jsonb_build_object('reachable', $3::boolean, 'dual_stack_ok', false)))`, row.agentID, row.at, row.reach); err != nil {
 			t.Fatal(err)
 		}
 	}
