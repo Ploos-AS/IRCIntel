@@ -73,7 +73,7 @@ INSERT INTO %s (
     observation_count, reachable_count, dual_stack_count,
     first_observed_at, last_observed_at
 )
-VALUES (date_trunc('%s', $1::timestamptz), $2, $3, $4, 1, $5, $6, $1, $1)
+VALUES (date_trunc('%s', $1::timestamptz, 'UTC'), $2, $3, $4, 1, $5, $6, $1, $1)
 ON CONFLICT (bucket_start, endpoint_host, endpoint_port, endpoint_tls) DO UPDATE SET
     observation_count = %s.observation_count + 1,
     reachable_count = %s.reachable_count + excluded.reachable_count,
@@ -89,20 +89,39 @@ ON CONFLICT (bucket_start, endpoint_host, endpoint_port, endpoint_tls) DO UPDATE
 
 func boolToInt64(v bool) int64 { if v { return 1 }; return 0 }
 
+// rebuildPostgresRollupsTx always rebuilds complete UTC buckets. Callers may
+// pass arbitrary timestamps; each granularity expands them to the containing
+// bucket boundaries before deleting/recomputing data. This prevents a partial
+// rebuild from replacing a complete rollup with only one side of a retention
+// or repair cutoff.
 func rebuildPostgresRollupsTx(ctx context.Context, tx pgx.Tx, since, until time.Time) error {
-	where := make([]string, 0, 2)
-	args := make([]any, 0, 2)
-	if !since.IsZero() { args = append(args, since.UTC()); where = append(where, fmt.Sprintf("observed_at >= $%d", len(args))) }
-	if !until.IsZero() { args = append(args, until.UTC()); where = append(where, fmt.Sprintf("observed_at < $%d", len(args))) }
-	filter := ""
-	if len(where) > 0 { filter = " WHERE " + strings.Join(where, " AND ") }
-
 	for _, spec := range []struct{ table, trunc string }{{"observation_rollups_hourly", "hour"}, {"observation_rollups_daily", "day"}} {
+		bucketSince, bucketUntil := completeBucketRange(since, until, spec.trunc)
+
+		where := make([]string, 0, 2)
+		args := make([]any, 0, 2)
+		if !bucketSince.IsZero() {
+			args = append(args, bucketSince)
+			where = append(where, fmt.Sprintf("observed_at >= $%d", len(args)))
+		}
+		if !bucketUntil.IsZero() {
+			args = append(args, bucketUntil)
+			where = append(where, fmt.Sprintf("observed_at < $%d", len(args)))
+		}
+		filter := ""
+		if len(where) > 0 { filter = " WHERE " + strings.Join(where, " AND ") }
+
 		deleteSQL := "DELETE FROM " + spec.table
 		deleteArgs := make([]any, 0, 2)
 		deleteWhere := make([]string, 0, 2)
-		if !since.IsZero() { deleteArgs = append(deleteArgs, dateBucket(since, spec.trunc)); deleteWhere = append(deleteWhere, fmt.Sprintf("bucket_start >= $%d", len(deleteArgs))) }
-		if !until.IsZero() { deleteArgs = append(deleteArgs, dateBucket(until, spec.trunc)); deleteWhere = append(deleteWhere, fmt.Sprintf("bucket_start < $%d", len(deleteArgs))) }
+		if !bucketSince.IsZero() {
+			deleteArgs = append(deleteArgs, bucketSince)
+			deleteWhere = append(deleteWhere, fmt.Sprintf("bucket_start >= $%d", len(deleteArgs)))
+		}
+		if !bucketUntil.IsZero() {
+			deleteArgs = append(deleteArgs, bucketUntil)
+			deleteWhere = append(deleteWhere, fmt.Sprintf("bucket_start < $%d", len(deleteArgs)))
+		}
 		if len(deleteWhere) > 0 { deleteSQL += " WHERE " + strings.Join(deleteWhere, " AND ") }
 		if _, err := tx.Exec(ctx, deleteSQL, deleteArgs...); err != nil { return err }
 
@@ -112,7 +131,7 @@ INSERT INTO %s (
     observation_count, reachable_count, dual_stack_count,
     first_observed_at, last_observed_at
 )
-SELECT date_trunc('%s', observed_at), endpoint_host, endpoint_port, endpoint_tls,
+SELECT date_trunc('%s', observed_at, 'UTC'), endpoint_host, endpoint_port, endpoint_tls,
        COUNT(*),
        COUNT(*) FILTER (WHERE COALESCE((payload_json #>> '{result,reachable}')::boolean, false)),
        COUNT(*) FILTER (WHERE COALESCE((payload_json #>> '{result,dual_stack_ok}')::boolean, false)),
@@ -128,6 +147,22 @@ func dateBucket(t time.Time, granularity string) time.Time {
 	u := t.UTC()
 	if granularity == "day" { return time.Date(u.Year(), u.Month(), u.Day(), 0, 0, 0, 0, time.UTC) }
 	return u.Truncate(time.Hour)
+}
+
+func nextBucket(t time.Time, granularity string) time.Time {
+	start := dateBucket(t, granularity)
+	if granularity == "day" { return start.AddDate(0, 0, 1) }
+	return start.Add(time.Hour)
+}
+
+func completeBucketRange(since, until time.Time, granularity string) (time.Time, time.Time) {
+	var start, end time.Time
+	if !since.IsZero() { start = dateBucket(since, granularity) }
+	if !until.IsZero() {
+		end = dateBucket(until, granularity)
+		if !until.UTC().Equal(end) { end = nextBucket(until, granularity) }
+	}
+	return start, end
 }
 
 func (s *PostgresStore) RebuildObservationRollups(since, until time.Time) error {
