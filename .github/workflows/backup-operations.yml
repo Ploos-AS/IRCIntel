@@ -1,0 +1,77 @@
+name: Backup Operations
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  postgres-backup-operations:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: ircintel
+          POSTGRES_PASSWORD: ircintel
+          POSTGRES_DB: ircintel_backup_source
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ircintel -d ircintel_backup_source"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install PostgreSQL 17 client
+        run: |
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc --fail --silent --show-error https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(. /etc/os-release && echo $VERSION_CODENAME)-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client-17
+      - name: Seed source database
+        env:
+          PGPASSWORD: ircintel
+        run: |
+          psql -h 127.0.0.1 -U ircintel -d ircintel_backup_source -v ON_ERROR_STOP=1 <<'SQL'
+          CREATE TABLE backup_qualification (id integer PRIMARY KEY, value text NOT NULL);
+          INSERT INTO backup_qualification VALUES (1, 'm4.21');
+          SQL
+      - name: Create and verify backup
+        env:
+          IRCINTEL_DATABASE_URL: postgres://ircintel:ircintel@127.0.0.1:5432/ircintel_backup_source?sslmode=disable
+          IRCINTEL_BACKUP_DIR: /tmp/ircintel-backups
+        run: |
+          chmod +x ops/postgres/*.sh
+          backup="$(ops/postgres/backup-logical.sh)"
+          test -s "$backup"
+          test -s "$backup.sha256"
+          sha256sum -c "$backup.sha256"
+          pg_restore --list "$backup" | grep -q 'backup_qualification'
+          echo "BACKUP=$backup" >> "$GITHUB_ENV"
+      - name: Restore into fresh database
+        env:
+          PGPASSWORD: ircintel
+        run: |
+          psql -h 127.0.0.1 -U ircintel -d postgres -v ON_ERROR_STOP=1 -c 'CREATE DATABASE ircintel_backup_restored OWNER ircintel'
+          IRCINTEL_RESTORE_DATABASE_URL='postgres://ircintel:ircintel@127.0.0.1:5432/ircintel_backup_restored?sslmode=disable' \
+          IRCINTEL_RESTORE_CONFIRM='restore-into-empty-database' \
+            ops/postgres/restore-logical.sh "$BACKUP"
+          test "$(psql -h 127.0.0.1 -U ircintel -d ircintel_backup_restored -Atc "SELECT value FROM backup_qualification WHERE id=1")" = 'm4.21'
+      - name: Verify retention guardrails
+        env:
+          IRCINTEL_BACKUP_DIR: /tmp/ircintel-backups
+          IRCINTEL_BACKUP_RETENTION_DAYS: 30
+        run: |
+          touch -d '45 days ago' /tmp/ircintel-backups/ircintel-20000101T000000Z.dump
+          touch -d '45 days ago' /tmp/ircintel-backups/ircintel-20000101T000000Z.dump.sha256
+          touch -d '45 days ago' /tmp/ircintel-backups/unrelated.keep
+          ops/postgres/prune-logical-backups.sh
+          test ! -e /tmp/ircintel-backups/ircintel-20000101T000000Z.dump
+          test ! -e /tmp/ircintel-backups/ircintel-20000101T000000Z.dump.sha256
+          test -e /tmp/ircintel-backups/unrelated.keep
+          test -s "$BACKUP"
