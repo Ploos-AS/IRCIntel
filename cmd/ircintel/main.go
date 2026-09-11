@@ -61,6 +61,9 @@ func main() {
 	var networkHistoricalReader core.NetworkHistoricalStatsReader
 	if reader, ok := store.(core.NetworkHistoricalStatsReader); ok { networkHistoricalReader = reader }
 	networkHistoricalStats := core.NetworkHistoricalStatsHandler{Token: token, Reader: networkHistoricalReader}
+	var networkRankingReader core.NetworkHistoryRankingReader
+	if reader, ok := store.(core.NetworkHistoryRankingReader); ok { networkRankingReader = reader }
+	networkHistoryRanking := core.NetworkHistoryRankingHandler{Token: token, Reader: networkRankingReader}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.Header().Set("Content-Type", "text/plain; charset=utf-8"); w.WriteHeader(http.StatusOK); _, _ = w.Write([]byte("ok\n")) })
@@ -69,6 +72,7 @@ func main() {
 	mux.Handle("POST /api/v1/observations", ingest)
 	mux.Handle("GET /api/v1/history/observations", historicalStats)
 	mux.Handle("GET /api/v1/history/networks", networkHistoricalStats)
+	mux.Handle("GET /api/v1/history/networks/ranking", networkHistoryRanking)
 	mux.Handle("GET /api/v1/endpoints/status", status)
 	mux.Handle("GET /api/v1/networks/status", networkStatus)
 	mux.Handle("GET /api/v1/networks/incidents", networkIncidents)
