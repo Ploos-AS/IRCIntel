@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 // EndpointNetworkOwnership records the registry identity that owned one endpoint
@@ -20,6 +21,13 @@ type EndpointNetworkOwnership struct {
 	TLS        bool       `json:"tls"`
 	ValidFrom  time.Time  `json:"valid_from"`
 	ValidTo    *time.Time `json:"valid_to,omitempty"`
+}
+
+func ownershipTime(value pgtype.Timestamptz) time.Time {
+	if !value.Valid || value.InfinityModifier == pgtype.NegativeInfinity {
+		return time.Time{}
+	}
+	return value.Time.UTC()
 }
 
 func ensurePostgresNetworkOwnershipTx(ctx context.Context, tx pgx.Tx) error {
@@ -92,19 +100,23 @@ WHERE e.id = $1`, endpointID).Scan(
 	}
 
 	var active EndpointNetworkOwnership
+	var activeValidFrom pgtype.Timestamptz
 	err := tx.QueryRow(ctx, `
 SELECT endpoint_id, server_id, network_id, host, port, tls, valid_from
 FROM endpoint_network_ownership
 WHERE endpoint_id = $1 AND valid_to IS NULL`, endpointID).Scan(
 		&active.EndpointID, &active.ServerID, &active.NetworkID,
-		&active.Host, &active.Port, &active.TLS, &active.ValidFrom,
+		&active.Host, &active.Port, &active.TLS, &activeValidFrom,
 	)
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) { return err }
+	if err == nil {
+		active.ValidFrom = ownershipTime(activeValidFrom)
+	}
 	if err == nil && active.ServerID == current.ServerID && active.NetworkID == current.NetworkID && active.Host == current.Host && active.Port == current.Port && active.TLS == current.TLS {
 		return nil
 	}
 	if err == nil {
-		if !changedAt.After(active.ValidFrom) {
+		if !active.ValidFrom.IsZero() && !changedAt.After(active.ValidFrom) {
 			changedAt = active.ValidFrom.Add(time.Microsecond)
 		}
 		if _, err := tx.Exec(ctx, `UPDATE endpoint_network_ownership SET valid_to = $2 WHERE endpoint_id = $1 AND valid_to IS NULL`, endpointID, changedAt); err != nil { return err }
@@ -138,7 +150,14 @@ ORDER BY valid_from`, endpointID)
 	out := make([]EndpointNetworkOwnership, 0)
 	for rows.Next() {
 		var item EndpointNetworkOwnership
-		if err := rows.Scan(&item.EndpointID, &item.ServerID, &item.NetworkID, &item.Host, &item.Port, &item.TLS, &item.ValidFrom, &item.ValidTo); err != nil { return nil, err }
+		var validFrom pgtype.Timestamptz
+		var validTo pgtype.Timestamptz
+		if err := rows.Scan(&item.EndpointID, &item.ServerID, &item.NetworkID, &item.Host, &item.Port, &item.TLS, &validFrom, &validTo); err != nil { return nil, err }
+		item.ValidFrom = ownershipTime(validFrom)
+		if validTo.Valid && validTo.InfinityModifier == pgtype.Finite {
+			value := validTo.Time.UTC()
+			item.ValidTo = &value
+		}
 		out = append(out, item)
 	}
 	if err := rows.Err(); err != nil { return nil, err }
