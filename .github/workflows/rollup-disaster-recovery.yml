@@ -1,0 +1,169 @@
+name: Rollup Disaster Recovery
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  postgres-rollup-disaster-recovery:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: ircintel
+          POSTGRES_PASSWORD: ircintel
+          POSTGRES_DB: ircintel_rollup_dr_source
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ircintel -d ircintel_rollup_dr_source"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      IRCINTEL_STORAGE_BACKEND: postgres
+      IRCINTEL_DATABASE_URL: postgres://ircintel:ircintel@127.0.0.1:5432/ircintel_rollup_dr_source?sslmode=disable
+      IRCINTEL_CORE_TOKEN: rollup-dr-token
+      IRCINTEL_LISTEN: 127.0.0.1:18083
+      PGPASSWORD: ircintel
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+      - name: Install PostgreSQL 17 client
+        run: |
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc --fail --silent --show-error https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(. /etc/os-release && echo $VERSION_CODENAME)-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client-17
+          echo '/usr/lib/postgresql/17/bin' >> "$GITHUB_PATH"
+      - name: Verify PostgreSQL 17 client selection
+        run: |
+          test "$(pg_dump --version | awk '{print $3}' | cut -d. -f1)" = '17'
+          test "$(pg_restore --version | awk '{print $3}' | cut -d. -f1)" = '17'
+          test "$(psql --version | awk '{print $3}' | cut -d. -f1)" = '17'
+      - name: Build and start Core
+        run: |
+          go build -o /tmp/ircintel ./cmd/ircintel
+          /tmp/ircintel > /tmp/ircintel-rollup-dr-source.log 2>&1 &
+          echo $! > /tmp/ircintel-rollup-dr.pid
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:18083/readyz >/dev/null; then
+              exit 0
+            fi
+            if [ "$attempt" -eq 30 ]; then
+              cat /tmp/ircintel-rollup-dr-source.log
+              exit 1
+            fi
+            sleep 1
+          done
+      - name: Seed rollups and resumable backfill checkpoint
+        run: |
+          auth='Authorization: Bearer rollup-dr-token'
+          for payload in \
+            '{"agent_id":"rollup-dr-a","observed_at":"2026-09-10T10:05:00Z","endpoint":{"host":"irc.rollup-dr.example","port":"6697","tls":true},"result":{"reachable":true,"dual_stack_ok":true}}' \
+            '{"agent_id":"rollup-dr-b","observed_at":"2026-09-10T10:35:00Z","endpoint":{"host":"irc.rollup-dr.example","port":"6697","tls":true},"result":{"reachable":false,"dual_stack_ok":false}}'; do
+            curl --fail --silent -X POST -H "$auth" -H 'Content-Type: application/json' --data "$payload" \
+              http://127.0.0.1:18083/api/v1/observations
+          done
+
+          psql -h 127.0.0.1 -U ircintel -d ircintel_rollup_dr_source -v ON_ERROR_STOP=1 <<'SQL'
+          CREATE TABLE IF NOT EXISTS observation_rollup_backfill_state (
+              id SMALLINT PRIMARY KEY CHECK (id = 1),
+              next_start TIMESTAMPTZ,
+              upper_bound TIMESTAMPTZ,
+              completed BOOLEAN NOT NULL DEFAULT false,
+              updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+          );
+          INSERT INTO observation_rollup_backfill_state(id, next_start, upper_bound, completed, updated_at)
+          VALUES (1, '2026-08-01T00:00:00Z', '2026-09-01T00:00:00Z', false, '2026-09-11T07:00:00Z')
+          ON CONFLICT (id) DO UPDATE SET
+              next_start = excluded.next_start,
+              upper_bound = excluded.upper_bound,
+              completed = excluded.completed,
+              updated_at = excluded.updated_at;
+          SQL
+
+          test "$(psql -h 127.0.0.1 -U ircintel -d ircintel_rollup_dr_source -Atc "SELECT observation_count || ':' || reachable_count || ':' || dual_stack_count FROM observation_rollups_hourly WHERE endpoint_host='irc.rollup-dr.example' AND bucket_start='2026-09-10T10:00:00Z'")" = '2:1:1'
+          test "$(psql -h 127.0.0.1 -U ircintel -d ircintel_rollup_dr_source -Atc "SELECT observation_count || ':' || reachable_count || ':' || dual_stack_count FROM observation_rollups_daily WHERE endpoint_host='irc.rollup-dr.example' AND bucket_start='2026-09-10T00:00:00Z'")" = '2:1:1'
+          test "$(psql -h 127.0.0.1 -U ircintel -d ircintel_rollup_dr_source -Atc "SELECT next_start AT TIME ZONE 'UTC' || '|' || upper_bound AT TIME ZONE 'UTC' || '|' || completed FROM observation_rollup_backfill_state WHERE id=1")" = '2026-08-01 00:00:00|2026-09-01 00:00:00|f'
+      - name: Create logical backup with production script
+        env:
+          IRCINTEL_BACKUP_DIR: /tmp/ircintel-rollup-dr-backups
+        run: |
+          chmod +x ops/postgres/*.sh
+          backup="$(ops/postgres/backup-logical.sh)"
+          test -s "$backup"
+          test -s "$backup.sha256"
+          sha256sum -c "$backup.sha256"
+          pg_restore --list "$backup" | grep -q 'observation_rollups_hourly'
+          pg_restore --list "$backup" | grep -q 'observation_rollups_daily'
+          pg_restore --list "$backup" | grep -q 'observation_rollup_backfill_state'
+          echo "BACKUP=$backup" >> "$GITHUB_ENV"
+      - name: Restore into fresh database with production script
+        run: |
+          psql -h 127.0.0.1 -U ircintel -d postgres -v ON_ERROR_STOP=1 \
+            -c 'CREATE DATABASE ircintel_rollup_dr_restored OWNER ircintel'
+          IRCINTEL_RESTORE_DATABASE_URL='postgres://ircintel:ircintel@127.0.0.1:5432/ircintel_rollup_dr_restored?sslmode=disable' \
+          IRCINTEL_RESTORE_CONFIRM='restore-into-empty-database' \
+            ops/postgres/restore-logical.sh "$BACKUP"
+      - name: Verify restored rollups and checkpoint exactly
+        run: |
+          source_hourly="$(psql -h 127.0.0.1 -U ircintel -d ircintel_rollup_dr_source -Atc "SELECT bucket_start AT TIME ZONE 'UTC' || '|' || observation_count || '|' || reachable_count || '|' || dual_stack_count || '|' || first_observed_at AT TIME ZONE 'UTC' || '|' || last_observed_at AT TIME ZONE 'UTC' FROM observation_rollups_hourly WHERE endpoint_host='irc.rollup-dr.example' ORDER BY bucket_start")"
+          restored_hourly="$(psql -h 127.0.0.1 -U ircintel -d ircintel_rollup_dr_restored -Atc "SELECT bucket_start AT TIME ZONE 'UTC' || '|' || observation_count || '|' || reachable_count || '|' || dual_stack_count || '|' || first_observed_at AT TIME ZONE 'UTC' || '|' || last_observed_at AT TIME ZONE 'UTC' FROM observation_rollups_hourly WHERE endpoint_host='irc.rollup-dr.example' ORDER BY bucket_start")"
+          test "$source_hourly" = "$restored_hourly"
+
+          source_daily="$(psql -h 127.0.0.1 -U ircintel -d ircintel_rollup_dr_source -Atc "SELECT bucket_start AT TIME ZONE 'UTC' || '|' || observation_count || '|' || reachable_count || '|' || dual_stack_count || '|' || first_observed_at AT TIME ZONE 'UTC' || '|' || last_observed_at AT TIME ZONE 'UTC' FROM observation_rollups_daily WHERE endpoint_host='irc.rollup-dr.example' ORDER BY bucket_start")"
+          restored_daily="$(psql -h 127.0.0.1 -U ircintel -d ircintel_rollup_dr_restored -Atc "SELECT bucket_start AT TIME ZONE 'UTC' || '|' || observation_count || '|' || reachable_count || '|' || dual_stack_count || '|' || first_observed_at AT TIME ZONE 'UTC' || '|' || last_observed_at AT TIME ZONE 'UTC' FROM observation_rollups_daily WHERE endpoint_host='irc.rollup-dr.example' ORDER BY bucket_start")"
+          test "$source_daily" = "$restored_daily"
+
+          source_checkpoint="$(psql -h 127.0.0.1 -U ircintel -d ircintel_rollup_dr_source -Atc "SELECT next_start AT TIME ZONE 'UTC' || '|' || upper_bound AT TIME ZONE 'UTC' || '|' || completed || '|' || updated_at AT TIME ZONE 'UTC' FROM observation_rollup_backfill_state WHERE id=1")"
+          restored_checkpoint="$(psql -h 127.0.0.1 -U ircintel -d ircintel_rollup_dr_restored -Atc "SELECT next_start AT TIME ZONE 'UTC' || '|' || upper_bound AT TIME ZONE 'UTC' || '|' || completed || '|' || updated_at AT TIME ZONE 'UTC' FROM observation_rollup_backfill_state WHERE id=1")"
+          test "$source_checkpoint" = "$restored_checkpoint"
+      - name: Start Core on restored database
+        env:
+          IRCINTEL_DATABASE_URL: postgres://ircintel:ircintel@127.0.0.1:5432/ircintel_rollup_dr_restored?sslmode=disable
+        run: |
+          kill "$(cat /tmp/ircintel-rollup-dr.pid)"
+          for attempt in $(seq 1 20); do
+            if ! kill -0 "$(cat /tmp/ircintel-rollup-dr.pid)" 2>/dev/null; then break; fi
+            sleep 1
+          done
+          /tmp/ircintel > /tmp/ircintel-rollup-dr-restored.log 2>&1 &
+          echo $! > /tmp/ircintel-rollup-dr.pid
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:18083/readyz >/dev/null; then
+              exit 0
+            fi
+            if [ "$attempt" -eq 30 ]; then
+              cat /tmp/ircintel-rollup-dr-restored.log
+              exit 1
+            fi
+            sleep 1
+          done
+      - name: Verify restored history remains queryable
+        run: |
+          auth='Authorization: Bearer rollup-dr-token'
+          curl --fail --silent -H "$auth" 'http://127.0.0.1:18083/api/v1/history/observations?period=7d&host=irc.rollup-dr.example' > /tmp/rollup-dr-history.json
+          python3 - <<'PY'
+          import json
+          data = json.load(open('/tmp/rollup-dr-history.json'))
+          assert data['granularity'] == 'hour'
+          points = data['points']
+          assert any(p['observation_count'] == 2 and p['reachable_count'] == 1 and p['dual_stack_count'] == 1 for p in points)
+          PY
+      - name: Show Core logs on failure
+        if: failure()
+        run: |
+          cat /tmp/ircintel-rollup-dr-source.log 2>/dev/null || true
+          cat /tmp/ircintel-rollup-dr-restored.log 2>/dev/null || true
+      - name: Stop Core
+        if: always()
+        run: |
+          if [ -f /tmp/ircintel-rollup-dr.pid ]; then kill "$(cat /tmp/ircintel-rollup-dr.pid)" 2>/dev/null || true; fi
