@@ -27,9 +27,15 @@ jobs:
             -c archive_mode=on \
             -c "archive_command=test ! -f /archive/%f && cp %p /archive/%f"
 
+          # pg_isready only proves that a server is accepting connections; during
+          # the postgres image's first-start initialization it can become true
+          # before POSTGRES_DB has been created. Wait for the requested database
+          # to be queryable so the qualification fixture is deterministic.
           for attempt in $(seq 1 30); do
-            docker exec pitr-source pg_isready -U ircintel -d ircintel >/dev/null 2>&1 && break
-            test "$attempt" -lt 30
+            if docker exec pitr-source psql -U ircintel -d ircintel -Atc 'SELECT 1' 2>/dev/null | grep -qx '1'; then
+              break
+            fi
+            if [ "$attempt" -eq 30 ]; then docker logs pitr-source; exit 1; fi
             sleep 1
           done
 
