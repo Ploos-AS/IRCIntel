@@ -32,10 +32,10 @@ type storageConfig struct {
 }
 
 type maintenanceConfig struct {
-	Enabled       bool
-	Interval      time.Duration
-	RawRetention  time.Duration
-	HourlyRetention time.Duration
+	Enabled          bool
+	Interval         time.Duration
+	RawRetention     time.Duration
+	HourlyRetention  time.Duration
 }
 
 func main() {
@@ -49,6 +49,9 @@ func main() {
 	store, err := openStorage(storage)
 	if err != nil { log.Fatalf("open observation store: %v", err) }
 	defer store.Close()
+	readiness, ok := store.(core.ReadinessChecker)
+	if !ok { log.Fatalf("storage backend does not implement readiness checks") }
+
 	token := os.Getenv("IRCINTEL_CORE_TOKEN")
 	ingest := core.IngestHandler{Token: token, Store: store}
 	read := core.ReadHandler{Token: token, Reader: store}
@@ -90,9 +93,14 @@ func main() {
 		log.Printf("maintenance enabled interval=%s raw_retention=%s hourly_retention=%s", maintenanceCfg.Interval, maintenanceCfg.RawRetention, maintenanceCfg.HourlyRetention)
 	}
 	maintenanceStatus := core.MaintenanceStatusHandler{Token: token, Provider: maintenanceProvider}
+	readinessHandler := core.ReadinessHandler{Checker: readiness}
+	runtimeMetrics := core.NewRuntimeMetrics()
+	metricsHandler := core.MetricsHandler{Metrics: runtimeMetrics, Ready: readiness, Maintenance: maintenanceProvider}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.Header().Set("Content-Type", "text/plain; charset=utf-8"); w.WriteHeader(http.StatusOK); _, _ = w.Write([]byte("ok\n")) })
+	mux.Handle("GET /readyz", readinessHandler)
+	mux.Handle("GET /metrics", metricsHandler)
 	mux.HandleFunc("GET /api/v1/version", func(w http.ResponseWriter, _ *http.Request) { w.Header().Set("Content-Type", "application/json"); _ = json.NewEncoder(w).Encode(versionResponse{Name: "IRCIntel", Version: version}) })
 	mux.Handle("GET /api/v1/maintenance/status", maintenanceStatus)
 	mux.Handle("GET /api/v1/observations", read)
@@ -121,7 +129,7 @@ func main() {
 	mux.HandleFunc("GET /api/v1/discovery/promotions", discoveryPromotion.List)
 	mux.Handle("GET /api/v1/probe-plan", probePlan)
 
-	srv := &http.Server{Addr: listen, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	srv := &http.Server{Addr: listen, Handler: runtimeMetrics.Wrap(mux), ReadHeaderTimeout: 5 * time.Second}
 	log.Printf("IRCIntel %s listening on %s (storage=%s)", version, listen, storage.Backend)
 	log.Fatal(srv.ListenAndServe())
 }
