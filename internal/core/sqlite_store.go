@@ -1,7 +1,6 @@
 package core
 
 import (
-	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -78,17 +77,141 @@ CREATE TABLE IF NOT EXISTS discovery_candidates (
     first_seen TEXT NOT NULL,
     last_seen TEXT NOT NULL,
     seen_count INTEGER NOT NULL DEFAULT 1,
-    CHECK(status IN ('pending','accepted','rejected'))`) ; return err
+    CHECK(status IN ('pending','accepted','rejected'))
+);
+CREATE INDEX IF NOT EXISTS idx_discovery_candidates_status_seen ON discovery_candidates(status, last_seen DESC);
+CREATE INDEX IF NOT EXISTS idx_discovery_candidates_endpoint ON discovery_candidates(host, port, tls);
+CREATE TABLE IF NOT EXISTS discovery_reviews (
+    candidate_id TEXT PRIMARY KEY,
+    status TEXT NOT NULL,
+    reviewer TEXT NOT NULL,
+    note TEXT NOT NULL DEFAULT '',
+    reviewed_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_discovery_reviews_time ON discovery_reviews(reviewed_at DESC);
+CREATE TABLE IF NOT EXISTS discovery_promotions (
+    candidate_id TEXT PRIMARY KEY,
+    endpoint_id TEXT NOT NULL,
+    server_id TEXT NOT NULL,
+    promoter TEXT NOT NULL,
+    note TEXT NOT NULL DEFAULT '',
+    promoted_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_discovery_promotions_time ON discovery_promotions(promoted_at DESC);`)
+			return err
 		}); err != nil { return err }
 		version = 2
 	}
 
-	// Remaining migrations are intentionally kept in the original file history.
-	// Existing migrate logic below this point is unchanged by M4.17.
-	return s.finishMigrations(version)
+	if version == 2 {
+		if err := s.runMigration(3, func(tx *sql.Tx) error {
+			_, err := tx.Exec(`
+DELETE FROM observations
+WHERE id NOT IN (
+    SELECT MAX(id)
+    FROM observations
+    GROUP BY agent_id, observed_at, endpoint_host, COALESCE(endpoint_port, ''), endpoint_tls
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_observations_identity
+    ON observations(agent_id, observed_at, endpoint_host, COALESCE(endpoint_port, ''), endpoint_tls);`)
+			return err
+		}); err != nil { return err }
+		version = 3
+	}
+
+	if version == 3 {
+		if err := s.runMigration(4, normalizeNetworkIncidentTimesTx); err != nil { return err }
+		version = 4
+	}
+
+	if version == 4 {
+		if err := s.runMigration(5, migrateAgentEndpointStateTx); err != nil { return err }
+		version = 5
+	}
+
+	// M3.29 persists reachability transitions separately from raw observations.
+	// Existing databases are backfilled once so incident maintenance can switch to
+	// transition-event replay without losing historical lifecycle semantics.
+	if version == 5 {
+		if err := s.runMigration(6, migrateEndpointTransitionEventsTx); err != nil { return err }
+	}
+	return nil
 }
 
-func (s *SQLiteStore) Ping(ctx context.Context) error {
+func (s *SQLiteStore) runMigration(targetVersion int, apply func(*sql.Tx) error) error {
 	if s == nil || s.db == nil { return errors.New("sqlite store is not open") }
-	return s.db.PingContext(ctx)
+	tx, err := s.db.Begin()
+	if err != nil { return err }
+	defer tx.Rollback()
+	if err := apply(tx); err != nil { return err }
+	if _, err := tx.Exec(fmt.Sprintf("PRAGMA user_version = %d", targetVersion)); err != nil { return err }
+	return tx.Commit()
 }
+
+func (s *SQLiteStore) normalizeLegacyTimes() error {
+	if s == nil || s.db == nil { return errors.New("sqlite store is not open") }
+	tx, err := s.db.Begin()
+	if err != nil { return err }
+	defer tx.Rollback()
+	if err := normalizeLegacyTimesTx(tx); err != nil { return err }
+	return tx.Commit()
+}
+
+func normalizeLegacyTimesTx(tx *sql.Tx) error {
+	if tx == nil { return errors.New("sqlite transaction is required") }
+	type timestampUpdate struct { id int64; value string }
+	observationRows, err := tx.Query(`SELECT id, payload_json FROM observations`); if err != nil{return err}
+	observationUpdates:=make([]timestampUpdate,0)
+	for observationRows.Next(){var id int64;var payload []byte;if err:=observationRows.Scan(&id,&payload);err!=nil{_ = observationRows.Close();return err};var observation agent.Observation;if err:=json.Unmarshal(payload,&observation);err!=nil{_ = observationRows.Close();return err};observationUpdates=append(observationUpdates,timestampUpdate{id,formatObservationTime(observation.ObservedAt)})}
+	if err:=observationRows.Err();err!=nil{_ = observationRows.Close();return err};if err:=observationRows.Close();err!=nil{return err}
+	incidentRows,err:=tx.Query(`SELECT id, payload_json FROM incident_records`);if err!=nil{return err};incidentUpdates:=make([]timestampUpdate,0)
+	for incidentRows.Next(){var id int64;var payload []byte;if err:=incidentRows.Scan(&id,&payload);err!=nil{_ = incidentRows.Close();return err};var incident IncidentLifecycle;if err:=json.Unmarshal(payload,&incident);err!=nil{_ = incidentRows.Close();return err};incidentUpdates=append(incidentUpdates,timestampUpdate{id,formatObservationTime(incident.StartedAt)})}
+	if err:=incidentRows.Err();err!=nil{_ = incidentRows.Close();return err};if err:=incidentRows.Close();err!=nil{return err}
+	for _,u:=range observationUpdates{if _,err:=tx.Exec(`UPDATE observations SET observed_at = ? WHERE id = ?`,u.value,u.id);err!=nil{return err}}
+	for _,u:=range incidentUpdates{if _,err:=tx.Exec(`UPDATE incident_records SET started_at = ? WHERE id = ?`,u.value,u.id);err!=nil{return err}}
+	return nil
+}
+
+func normalizeNetworkIncidentTimesTx(tx *sql.Tx) error {
+	if tx == nil { return errors.New("sqlite transaction is required") }
+	type timestampUpdate struct { id int64; value string }
+	rows, err := tx.Query(`SELECT id, payload_json FROM network_incident_records`)
+	if err != nil { return err }
+	updates := make([]timestampUpdate, 0)
+	for rows.Next() {
+		var id int64
+		var payload []byte
+		if err := rows.Scan(&id, &payload); err != nil { _ = rows.Close(); return err }
+		var incident NetworkIncident
+		if err := json.Unmarshal(payload, &incident); err != nil { _ = rows.Close(); return err }
+		updates = append(updates, timestampUpdate{id: id, value: formatObservationTime(incident.StartedAt)})
+	}
+	if err := rows.Err(); err != nil { _ = rows.Close(); return err }
+	if err := rows.Close(); err != nil { return err }
+	for _, update := range updates {
+		if _, err := tx.Exec(`UPDATE network_incident_records SET started_at = ? WHERE id = ?`, update.value, update.id); err != nil { return err }
+	}
+	return nil
+}
+
+func (s *SQLiteStore) Store(observation agent.Observation) error {
+	if s==nil||s.db==nil{return errors.New("sqlite store is not open")};payload,err:=json.Marshal(observation);if err!=nil{return err}
+	tx,err:=s.db.Begin();if err!=nil{return err};defer tx.Rollback()
+	result,err:=tx.Exec(`INSERT OR IGNORE INTO observations (agent_id, observed_at, endpoint_host, endpoint_port, endpoint_tls, payload_json) VALUES (?, ?, ?, ?, ?, ?)`,observation.AgentID,formatObservationTime(observation.ObservedAt),observation.Endpoint.Host,observation.Endpoint.Port,observation.Endpoint.TLS,payload);if err!=nil{return err}
+	rows,err:=result.RowsAffected();if err!=nil{return err};if rows==0{return tx.Commit()}
+	transitioned,err:=persistTransitionForObservationTx(tx,observation);if err!=nil{return err}
+	if transitioned {
+		if err:=refreshIncidentRecordsTx(tx);err!=nil{return err}
+		if err:=refreshNetworkIncidentRecordsTx(tx);err!=nil{return err}
+	}
+	if err:=upsertAgentEndpointStateTx(tx,observation);err!=nil{return err}
+	return tx.Commit()
+}
+
+func (s *SQLiteStore) List(query ObservationQuery) ([]agent.Observation,error){if s==nil||s.db==nil{return nil,errors.New("sqlite store is not open")};if query.Limit<1||query.Limit>maxObservationLimit{return nil,errors.New("invalid observation limit")};if !query.Since.IsZero()&&!query.Until.IsZero()&&query.Since.After(query.Until){return nil,errors.New("invalid observation time range")};where:=make([]string,0,4);args:=make([]any,0,5);if query.AgentID!=""{where=append(where,"agent_id = ?");args=append(args,query.AgentID)};if query.Host!=""{where=append(where,"endpoint_host = ?");args=append(args,query.Host)};if !query.Since.IsZero(){where=append(where,"observed_at >= ?");args=append(args,formatObservationTime(query.Since))};if !query.Until.IsZero(){where=append(where,"observed_at <= ?");args=append(args,formatObservationTime(query.Until))};statement:="SELECT payload_json FROM observations";if len(where)>0{statement+=" WHERE "+strings.Join(where," AND ")};statement+=" ORDER BY observed_at DESC, id DESC LIMIT ?";args=append(args,query.Limit);rows,err:=s.db.Query(statement,args...);if err!=nil{return nil,err};defer rows.Close();return decodeObservationRows(rows)}
+func (s *SQLiteStore) LatestEndpointObservations()([]agent.Observation,error){if s==nil||s.db==nil{return nil,errors.New("sqlite store is not open")};rows,err:=s.db.Query(`SELECT payload_json FROM (SELECT payload_json, ROW_NUMBER() OVER (PARTITION BY agent_id, endpoint_host, endpoint_port, endpoint_tls ORDER BY observed_at DESC, id DESC) AS row_number FROM observations) WHERE row_number = 1`);if err!=nil{return nil,err};defer rows.Close();return decodeObservationRows(rows)}
+func (s *SQLiteStore) RecentObservations(limit int)([]agent.Observation,error){if s==nil||s.db==nil{return nil,errors.New("sqlite store is not open")};if limit<1{return nil,errors.New("invalid recent observation limit")};rows,err:=s.db.Query(`SELECT payload_json FROM observations ORDER BY observed_at DESC, id DESC LIMIT ?`,limit);if err!=nil{return nil,err};defer rows.Close();return decodeObservationRows(rows)}
+func decodeObservationRows(rows *sql.Rows)([]agent.Observation,error){out:=make([]agent.Observation,0);for rows.Next(){var payload []byte;if err:=rows.Scan(&payload);err!=nil{return nil,err};var o agent.Observation;if err:=json.Unmarshal(payload,&o);err!=nil{return nil,err};out=append(out,o)};if err:=rows.Err();err!=nil{return nil,err};return out,nil}
+func formatObservationTime(value time.Time)string{return value.UTC().Format(observationTimeLayout)}
+func (s *SQLiteStore) Count()(int,error){if s==nil||s.db==nil{return 0,errors.New("sqlite store is not open")};var count int;if err:=s.db.QueryRow(`SELECT COUNT(*) FROM observations`).Scan(&count);err!=nil{return 0,err};return count,nil}
+func (s *SQLiteStore) Close()error{if s==nil||s.db==nil{return nil};return s.db.Close()}
