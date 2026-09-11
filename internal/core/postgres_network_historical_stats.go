@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 )
 
 func (s *PostgresStore) HistoricalNetworkStats(query NetworkHistoricalStatsQuery) (NetworkHistoricalStatsSeries, error) {
@@ -20,7 +22,7 @@ func (s *PostgresStore) HistoricalNetworkStats(query NetworkHistoricalStatsQuery
 	defer cancel()
 	var networkName string
 	if err := s.pool.QueryRow(ctx, `SELECT name FROM networks WHERE id = $1`, query.NetworkID).Scan(&networkName); err != nil {
-		if strings.Contains(err.Error(), "no rows") { return NetworkHistoricalStatsSeries{}, ErrRegistryNetworkNotFound }
+		if errors.Is(err, pgx.ErrNoRows) { return NetworkHistoricalStatsSeries{}, ErrRegistryNetworkNotFound }
 		return NetworkHistoricalStatsSeries{}, err
 	}
 
