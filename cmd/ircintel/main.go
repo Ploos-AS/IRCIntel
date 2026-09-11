@@ -1,12 +1,14 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -16,6 +18,7 @@ import (
 var version = "dev"
 
 const defaultStatusFreshness = 15 * time.Minute
+const defaultMaintenanceInterval = 24 * time.Hour
 
 type versionResponse struct {
 	Name    string `json:"name"`
@@ -28,12 +31,21 @@ type storageConfig struct {
 	DatabaseURL string
 }
 
+type maintenanceConfig struct {
+	Enabled       bool
+	Interval      time.Duration
+	RawRetention  time.Duration
+	HourlyRetention time.Duration
+}
+
 func main() {
 	listen := getenv("IRCINTEL_LISTEN", ":8080")
 	statusFreshness, err := getenvDuration("IRCINTEL_STATUS_FRESHNESS", defaultStatusFreshness)
 	if err != nil { log.Fatalf("configure status freshness: %v", err) }
 	storage, err := storageConfigFromEnv()
 	if err != nil { log.Fatalf("configure storage: %v", err) }
+	maintenanceCfg, err := maintenanceConfigFromEnv()
+	if err != nil { log.Fatalf("configure maintenance: %v", err) }
 	store, err := openStorage(storage)
 	if err != nil { log.Fatalf("open observation store: %v", err) }
 	defer store.Close()
@@ -65,9 +77,24 @@ func main() {
 	if reader, ok := store.(core.NetworkHistoryRankingReader); ok { networkRankingReader = reader }
 	networkHistoryRanking := core.NetworkHistoryRankingHandler{Token: token, Reader: networkRankingReader}
 
+	var maintenanceProvider core.MaintenanceStatusProvider = core.StaticMaintenanceStatus(core.DisabledMaintenanceStatus())
+	if maintenanceCfg.Enabled {
+		runner, ok := store.(core.MaintenanceRunner)
+		if !ok { log.Fatalf("maintenance requires a storage backend with retention maintenance support") }
+		scheduler, err := core.NewMaintenanceScheduler(runner, core.RetentionPolicy{RawObservations: maintenanceCfg.RawRetention, HourlyRollups: maintenanceCfg.HourlyRetention}, maintenanceCfg.Interval)
+		if err != nil { log.Fatalf("configure maintenance scheduler: %v", err) }
+		maintenanceProvider = scheduler
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		go scheduler.Run(ctx)
+		log.Printf("maintenance enabled interval=%s raw_retention=%s hourly_retention=%s", maintenanceCfg.Interval, maintenanceCfg.RawRetention, maintenanceCfg.HourlyRetention)
+	}
+	maintenanceStatus := core.MaintenanceStatusHandler{Token: token, Provider: maintenanceProvider}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.Header().Set("Content-Type", "text/plain; charset=utf-8"); w.WriteHeader(http.StatusOK); _, _ = w.Write([]byte("ok\n")) })
 	mux.HandleFunc("GET /api/v1/version", func(w http.ResponseWriter, _ *http.Request) { w.Header().Set("Content-Type", "application/json"); _ = json.NewEncoder(w).Encode(versionResponse{Name: "IRCIntel", Version: version}) })
+	mux.Handle("GET /api/v1/maintenance/status", maintenanceStatus)
 	mux.Handle("GET /api/v1/observations", read)
 	mux.Handle("POST /api/v1/observations", ingest)
 	mux.Handle("GET /api/v1/history/observations", historicalStats)
@@ -118,6 +145,19 @@ func storageConfigFromEnv() (storageConfig, error) {
 	return cfg, nil
 }
 
+func maintenanceConfigFromEnv() (maintenanceConfig, error) {
+	enabled, err := getenvBool("IRCINTEL_MAINTENANCE_ENABLED", false)
+	if err != nil { return maintenanceConfig{}, err }
+	interval, err := getenvDuration("IRCINTEL_MAINTENANCE_INTERVAL", defaultMaintenanceInterval)
+	if err != nil { return maintenanceConfig{}, err }
+	rawRetention, err := getenvDuration("IRCINTEL_RAW_OBSERVATION_RETENTION", core.DefaultRawObservationRetention)
+	if err != nil { return maintenanceConfig{}, err }
+	hourlyRetention, err := getenvDuration("IRCINTEL_HOURLY_ROLLUP_RETENTION", core.DefaultHourlyRollupRetention)
+	if err != nil { return maintenanceConfig{}, err }
+	if hourlyRetention < rawRetention { return maintenanceConfig{}, errors.New("IRCINTEL_HOURLY_ROLLUP_RETENTION must not be shorter than IRCINTEL_RAW_OBSERVATION_RETENTION") }
+	return maintenanceConfig{Enabled: enabled, Interval: interval, RawRetention: rawRetention, HourlyRetention: hourlyRetention}, nil
+}
+
 func openStorage(cfg storageConfig) (core.RuntimeStore, error) {
 	switch cfg.Backend {
 	case "sqlite":
@@ -130,6 +170,14 @@ func openStorage(cfg storageConfig) (core.RuntimeStore, error) {
 }
 
 func getenv(key, fallback string) string { if value := os.Getenv(key); value != "" { return value }; return fallback }
+
+func getenvBool(key string, fallback bool) (bool, error) {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" { return fallback, nil }
+	value, err := strconv.ParseBool(raw)
+	if err != nil { return false, fmt.Errorf("%s must be a boolean: %w", key, err) }
+	return value, nil
+}
 
 func getenvDuration(key string, fallback time.Duration) (time.Duration, error) {
 	raw := os.Getenv(key)
