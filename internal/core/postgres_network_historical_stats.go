@@ -20,14 +20,20 @@ func (s *PostgresStore) HistoricalNetworkStats(query NetworkHistoricalStatsQuery
 
 	ctx, cancel := context.WithTimeout(context.Background(), postgresOperationTimeout)
 	defer cancel()
+	tx, err := s.pool.Begin(ctx)
+	if err != nil { return NetworkHistoricalStatsSeries{}, err }
+	defer tx.Rollback(ctx)
+	if err := ensurePostgresNetworkOwnershipTx(ctx, tx); err != nil { return NetworkHistoricalStatsSeries{}, err }
+
 	var networkName string
-	if err := s.pool.QueryRow(ctx, `SELECT name FROM networks WHERE id = $1`, query.NetworkID).Scan(&networkName); err != nil {
+	if err := tx.QueryRow(ctx, `SELECT name FROM networks WHERE id = $1`, query.NetworkID).Scan(&networkName); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) { return NetworkHistoricalStatsSeries{}, ErrRegistryNetworkNotFound }
 		return NetworkHistoricalStatsSeries{}, err
 	}
 
 	table := "observation_rollups_hourly"
-	if granularity == "day" { table = "observation_rollups_daily" }
+	bucketWidth := "1 hour"
+	if granularity == "day" { table = "observation_rollups_daily"; bucketWidth = "1 day" }
 	args := []any{query.NetworkID}
 	where := make([]string, 0, 2)
 	if !since.IsZero() {
@@ -37,28 +43,30 @@ func (s *PostgresStore) HistoricalNetworkStats(query NetworkHistoricalStatsQuery
 	args = append(args, query.Now.UTC())
 	where = append(where, fmt.Sprintf("r.bucket_start <= $%d", len(args)))
 
-	statement := `WITH endpoint_owners AS (
-    SELECT e.host, e.port, e.tls,
-           MIN(s.network_id) AS network_id,
-           COUNT(DISTINCT s.network_id) AS owner_count
-    FROM network_endpoints e
-    JOIN network_servers s ON s.id = e.server_id
-    GROUP BY e.host, e.port, e.tls
-), network_endpoints_unambiguous AS (
-    SELECT host, port, tls
-    FROM endpoint_owners
-    WHERE owner_count = 1 AND network_id = $1
+	statement := fmt.Sprintf(`WITH attributed_rollups AS (
+    SELECT r.bucket_start, r.endpoint_host, r.endpoint_port, r.endpoint_tls,
+           r.observation_count, r.reachable_count, r.dual_stack_count,
+           MIN(o.network_id) AS network_id,
+           COUNT(DISTINCT o.network_id) AS owner_count
+    FROM %s r
+    JOIN endpoint_network_ownership o
+      ON o.host = r.endpoint_host
+     AND o.port = r.endpoint_port
+     AND o.tls = r.endpoint_tls
+     AND o.valid_from <= r.bucket_start
+     AND (o.valid_to IS NULL OR o.valid_to >= r.bucket_start + INTERVAL '%s')
+    WHERE %s
+    GROUP BY r.bucket_start, r.endpoint_host, r.endpoint_port, r.endpoint_tls,
+             r.observation_count, r.reachable_count, r.dual_stack_count
 )
-SELECT r.bucket_start,
-       SUM(r.observation_count), SUM(r.reachable_count), SUM(r.dual_stack_count)
-FROM ` + table + ` r
-JOIN network_endpoints_unambiguous e
-  ON e.host = r.endpoint_host AND e.port = r.endpoint_port AND e.tls = r.endpoint_tls
-WHERE ` + strings.Join(where, " AND ") + `
-GROUP BY r.bucket_start
-ORDER BY r.bucket_start ASC`
+SELECT bucket_start,
+       SUM(observation_count), SUM(reachable_count), SUM(dual_stack_count)
+FROM attributed_rollups
+WHERE owner_count = 1 AND network_id = $1
+GROUP BY bucket_start
+ORDER BY bucket_start ASC`, table, bucketWidth, strings.Join(where, " AND "))
 
-	rows, err := s.pool.Query(ctx, statement, args...)
+	rows, err := tx.Query(ctx, statement, args...)
 	if err != nil { return NetworkHistoricalStatsSeries{}, err }
 	defer rows.Close()
 	points := make([]HistoricalStatsPoint, 0)
@@ -72,6 +80,7 @@ ORDER BY r.bucket_start ASC`
 		points = append(points, point)
 	}
 	if err := rows.Err(); err != nil { return NetworkHistoricalStatsSeries{}, err }
+	if err := tx.Commit(ctx); err != nil { return NetworkHistoricalStatsSeries{}, err }
 
 	series := NetworkHistoricalStatsSeries{
 		NetworkID: query.NetworkID,
