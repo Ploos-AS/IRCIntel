@@ -145,6 +145,127 @@ jobs:
         run: |
           if [ -f /tmp/ircintel.pid ]; then kill "$(cat /tmp/ircintel.pid)" 2>/dev/null || true; fi
 
+  postgres-disaster-recovery:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: ircintel
+          POSTGRES_PASSWORD: ircintel
+          POSTGRES_DB: ircintel_dr_source
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ircintel -d ircintel_dr_source"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      IRCINTEL_STORAGE_BACKEND: postgres
+      IRCINTEL_DATABASE_URL: postgres://ircintel:ircintel@127.0.0.1:5432/ircintel_dr_source?sslmode=disable
+      IRCINTEL_CORE_TOKEN: dr-test-token
+      IRCINTEL_LISTEN: 127.0.0.1:18082
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+      - name: Build Core
+        run: go build -o /tmp/ircintel ./cmd/ircintel
+      - name: Seed source database through Core
+        run: |
+          /tmp/ircintel > /tmp/ircintel-dr-source.log 2>&1 &
+          echo $! > /tmp/ircintel-dr.pid
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:18082/healthz | grep -qx 'ok'; then break; fi
+            if [ "$attempt" -eq 30 ]; then cat /tmp/ircintel-dr-source.log; exit 1; fi
+            sleep 1
+          done
+          auth='Authorization: Bearer dr-test-token'
+          curl --fail --silent -X POST -H "$auth" -H 'Content-Type: application/json' \
+            --data '{"id":"dr-net","name":"DR Network"}' \
+            http://127.0.0.1:18082/api/v1/registry/networks
+          curl --fail --silent -X POST -H "$auth" -H 'Content-Type: application/json' \
+            --data '{"id":"dr-server","network_id":"dr-net","name":"DR Server"}' \
+            http://127.0.0.1:18082/api/v1/registry/servers
+          curl --fail --silent -X POST -H "$auth" -H 'Content-Type: application/json' \
+            --data '{"id":"dr-endpoint","server_id":"dr-server","host":"irc.dr.example","port":"6697","tls":true}' \
+            http://127.0.0.1:18082/api/v1/registry/endpoints
+          for payload in \
+            '{"agent_id":"dr-agent-a","observed_at":"2026-09-10T10:00:00Z","endpoint":{"host":"irc.dr.example","port":"6697","tls":true},"result":{"reachable":true}}' \
+            '{"agent_id":"dr-agent-b","observed_at":"2026-09-10T10:00:10Z","endpoint":{"host":"irc.dr.example","port":"6697","tls":true},"result":{"reachable":true}}' \
+            '{"agent_id":"dr-agent-a","observed_at":"2026-09-10T10:01:00Z","endpoint":{"host":"irc.dr.example","port":"6697","tls":true},"result":{"reachable":false}}' \
+            '{"agent_id":"dr-agent-b","observed_at":"2026-09-10T10:02:00Z","endpoint":{"host":"irc.dr.example","port":"6697","tls":true},"result":{"reachable":false}}' \
+            '{"agent_id":"dr-agent-a","observed_at":"2026-09-10T10:10:00Z","endpoint":{"host":"irc.dr.example","port":"6697","tls":true},"result":{"reachable":true}}' \
+            '{"agent_id":"dr-agent-b","observed_at":"2026-09-10T10:11:00Z","endpoint":{"host":"irc.dr.example","port":"6697","tls":true},"result":{"reachable":true}}'; do
+            curl --fail --silent -X POST -H "$auth" -H 'Content-Type: application/json' --data "$payload" \
+              http://127.0.0.1:18082/api/v1/observations
+          done
+          curl --fail --silent -H "$auth" 'http://127.0.0.1:18082/api/v1/incidents/lifecycle?host=irc.dr.example&status=closed&limit=10' > /tmp/dr-incidents-before.json
+          python3 - <<'PY'
+          import json
+          incidents = json.load(open('/tmp/dr-incidents-before.json'))['incidents']
+          assert len(incidents) == 1
+          assert incidents[0]['status'] == 'closed'
+          PY
+      - name: Create PostgreSQL logical backup
+        run: |
+          docker run --rm --network host -e PGPASSWORD=ircintel postgres:17 \
+            pg_dump -h 127.0.0.1 -U ircintel -d ircintel_dr_source --format=custom --no-owner --no-acl \
+            > /tmp/ircintel-dr.dump
+          test -s /tmp/ircintel-dr.dump
+      - name: Restore backup into clean database
+        run: |
+          docker run --rm --network host -e PGPASSWORD=ircintel postgres:17 \
+            psql -h 127.0.0.1 -U ircintel -d postgres -v ON_ERROR_STOP=1 \
+            -c 'CREATE DATABASE ircintel_dr_restored OWNER ircintel'
+          cat /tmp/ircintel-dr.dump | docker run --rm -i --network host -e PGPASSWORD=ircintel postgres:17 \
+            pg_restore -h 127.0.0.1 -U ircintel -d ircintel_dr_restored --no-owner --no-acl --exit-on-error
+      - name: Start Core on restored database and verify recovery
+        env:
+          IRCINTEL_DATABASE_URL: postgres://ircintel:ircintel@127.0.0.1:5432/ircintel_dr_restored?sslmode=disable
+        run: |
+          kill "$(cat /tmp/ircintel-dr.pid)"
+          for attempt in $(seq 1 20); do
+            if ! kill -0 "$(cat /tmp/ircintel-dr.pid)" 2>/dev/null; then break; fi
+            sleep 1
+          done
+          /tmp/ircintel > /tmp/ircintel-dr-restored.log 2>&1 &
+          echo $! > /tmp/ircintel-dr.pid
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:18082/healthz | grep -qx 'ok'; then break; fi
+            if [ "$attempt" -eq 30 ]; then cat /tmp/ircintel-dr-restored.log; exit 1; fi
+            sleep 1
+          done
+          auth='Authorization: Bearer dr-test-token'
+          curl --fail --silent -H "$auth" http://127.0.0.1:18082/api/v1/registry > /tmp/dr-registry-after.json
+          curl --fail --silent -H "$auth" 'http://127.0.0.1:18082/api/v1/observations?host=irc.dr.example&limit=20' > /tmp/dr-observations-after.json
+          curl --fail --silent -H "$auth" 'http://127.0.0.1:18082/api/v1/incidents/lifecycle?host=irc.dr.example&status=closed&limit=10' > /tmp/dr-incidents-after.json
+          curl --fail --silent -H "$auth" 'http://127.0.0.1:18082/api/v1/networks/incidents/stats?network_id=dr-net' > /tmp/dr-stats-after.json
+          python3 - <<'PY'
+          import json
+          registry = json.load(open('/tmp/dr-registry-after.json'))
+          observations = json.load(open('/tmp/dr-observations-after.json'))['observations']
+          incidents = json.load(open('/tmp/dr-incidents-after.json'))['incidents']
+          stats = json.load(open('/tmp/dr-stats-after.json'))
+          assert any(n['id'] == 'dr-net' for n in registry['networks'])
+          assert any(e['id'] == 'dr-endpoint' for e in registry['endpoints'])
+          assert len(observations) == 6
+          assert len(incidents) == 1 and incidents[0]['status'] == 'closed'
+          assert stats['network_id'] == 'dr-net'
+          assert stats['total_incidents'] >= 1
+          PY
+      - name: Show disaster-recovery logs on failure
+        if: failure()
+        run: |
+          cat /tmp/ircintel-dr-source.log 2>/dev/null || true
+          cat /tmp/ircintel-dr-restored.log 2>/dev/null || true
+      - name: Stop Core
+        if: always()
+        run: |
+          if [ -f /tmp/ircintel-dr.pid ]; then kill "$(cat /tmp/ircintel-dr.pid)" 2>/dev/null || true; fi
+
   oci-runtime:
     runs-on: ubuntu-latest
     steps:
