@@ -116,11 +116,11 @@ jobs:
 
           hourly="$(psql -h 127.0.0.1 -U ircintel -d ircintel_rollup_dr_source -Atc "SELECT observation_count || ':' || reachable_count || ':' || dual_stack_count FROM observation_rollups_hourly WHERE endpoint_host='irc.rollup-dr.example' AND bucket_start='2026-09-10T10:00:00Z'")"
           daily="$(psql -h 127.0.0.1 -U ircintel -d ircintel_rollup_dr_source -Atc "SELECT observation_count || ':' || reachable_count || ':' || dual_stack_count FROM observation_rollups_daily WHERE endpoint_host='irc.rollup-dr.example' AND bucket_start='2026-09-10T00:00:00Z'")"
-          checkpoint="$(psql -h 127.0.0.1 -U ircintel -d ircintel_rollup_dr_source -Atc "SELECT next_start AT TIME ZONE 'UTC' || '|' || upper_bound AT TIME ZONE 'UTC' || '|' || completed FROM observation_rollup_backfill_state WHERE id=1")"
-          printf 'hourly=%s\ndaily=%s\ncheckpoint=%s\n' "$hourly" "$daily" "$checkpoint"
+          checkpoint="$(psql -h 127.0.0.1 -U ircintel -d ircintel_rollup_dr_source -Atc "SELECT to_char(next_start AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') || '|' || to_char(upper_bound AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') || '|' || completed::text FROM observation_rollup_backfill_state WHERE id=1")"
+          printf 'hourly=<%s>\ndaily=<%s>\ncheckpoint=<%s>\n' "$hourly" "$daily" "$checkpoint"
           test "$hourly" = '2:1:1'
           test "$daily" = '2:1:1'
-          test "$checkpoint" = '2026-08-01 00:00:00|2026-09-01 00:00:00|f'
+          test "$checkpoint" = '2026-08-01 00:00:00|2026-09-01 00:00:00|false'
       - name: Create logical backup with production script
         env:
           IRCINTEL_BACKUP_DIR: /tmp/ircintel-rollup-dr-backups
