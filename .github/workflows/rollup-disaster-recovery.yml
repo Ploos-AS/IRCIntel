@@ -63,17 +63,41 @@ jobs:
             fi
             sleep 1
           done
-      - name: Seed rollups and resumable backfill checkpoint
+      - name: Seed deterministic rollups and resumable backfill checkpoint
         run: |
-          auth='Authorization: Bearer rollup-dr-token'
-          for payload in \
-            '{"agent_id":"rollup-dr-a","observed_at":"2026-09-10T10:05:00Z","endpoint":{"host":"irc.rollup-dr.example","port":"6697","tls":true},"result":{"reachable":true,"dual_stack_ok":true}}' \
-            '{"agent_id":"rollup-dr-b","observed_at":"2026-09-10T10:35:00Z","endpoint":{"host":"irc.rollup-dr.example","port":"6697","tls":true},"result":{"reachable":false,"dual_stack_ok":false}}'; do
-            curl --fail --silent -X POST -H "$auth" -H 'Content-Type: application/json' --data "$payload" \
-              http://127.0.0.1:18083/api/v1/observations
-          done
-
           psql -h 127.0.0.1 -U ircintel -d ircintel_rollup_dr_source -v ON_ERROR_STOP=1 <<'SQL'
+          INSERT INTO observation_rollups_hourly (
+              bucket_start, endpoint_host, endpoint_port, endpoint_tls,
+              observation_count, reachable_count, dual_stack_count,
+              first_observed_at, last_observed_at
+          ) VALUES (
+              '2026-09-10T10:00:00Z', 'irc.rollup-dr.example', '6697', true,
+              2, 1, 1,
+              '2026-09-10T10:05:00Z', '2026-09-10T10:35:00Z'
+          )
+          ON CONFLICT (bucket_start, endpoint_host, endpoint_port, endpoint_tls) DO UPDATE SET
+              observation_count = excluded.observation_count,
+              reachable_count = excluded.reachable_count,
+              dual_stack_count = excluded.dual_stack_count,
+              first_observed_at = excluded.first_observed_at,
+              last_observed_at = excluded.last_observed_at;
+
+          INSERT INTO observation_rollups_daily (
+              bucket_start, endpoint_host, endpoint_port, endpoint_tls,
+              observation_count, reachable_count, dual_stack_count,
+              first_observed_at, last_observed_at
+          ) VALUES (
+              '2026-09-10T00:00:00Z', 'irc.rollup-dr.example', '6697', true,
+              2, 1, 1,
+              '2026-09-10T10:05:00Z', '2026-09-10T10:35:00Z'
+          )
+          ON CONFLICT (bucket_start, endpoint_host, endpoint_port, endpoint_tls) DO UPDATE SET
+              observation_count = excluded.observation_count,
+              reachable_count = excluded.reachable_count,
+              dual_stack_count = excluded.dual_stack_count,
+              first_observed_at = excluded.first_observed_at,
+              last_observed_at = excluded.last_observed_at;
+
           CREATE TABLE IF NOT EXISTS observation_rollup_backfill_state (
               id SMALLINT PRIMARY KEY CHECK (id = 1),
               next_start TIMESTAMPTZ,
@@ -90,9 +114,13 @@ jobs:
               updated_at = excluded.updated_at;
           SQL
 
-          test "$(psql -h 127.0.0.1 -U ircintel -d ircintel_rollup_dr_source -Atc "SELECT observation_count || ':' || reachable_count FROM observation_rollups_hourly WHERE endpoint_host='irc.rollup-dr.example' AND bucket_start='2026-09-10T10:00:00Z'")" = '2:1'
-          test "$(psql -h 127.0.0.1 -U ircintel -d ircintel_rollup_dr_source -Atc "SELECT observation_count || ':' || reachable_count FROM observation_rollups_daily WHERE endpoint_host='irc.rollup-dr.example' AND bucket_start='2026-09-10T00:00:00Z'")" = '2:1'
-          test "$(psql -h 127.0.0.1 -U ircintel -d ircintel_rollup_dr_source -Atc "SELECT next_start AT TIME ZONE 'UTC' || '|' || upper_bound AT TIME ZONE 'UTC' || '|' || completed FROM observation_rollup_backfill_state WHERE id=1")" = '2026-08-01 00:00:00|2026-09-01 00:00:00|f'
+          hourly="$(psql -h 127.0.0.1 -U ircintel -d ircintel_rollup_dr_source -Atc "SELECT observation_count || ':' || reachable_count || ':' || dual_stack_count FROM observation_rollups_hourly WHERE endpoint_host='irc.rollup-dr.example' AND bucket_start='2026-09-10T10:00:00Z'")"
+          daily="$(psql -h 127.0.0.1 -U ircintel -d ircintel_rollup_dr_source -Atc "SELECT observation_count || ':' || reachable_count || ':' || dual_stack_count FROM observation_rollups_daily WHERE endpoint_host='irc.rollup-dr.example' AND bucket_start='2026-09-10T00:00:00Z'")"
+          checkpoint="$(psql -h 127.0.0.1 -U ircintel -d ircintel_rollup_dr_source -Atc "SELECT next_start AT TIME ZONE 'UTC' || '|' || upper_bound AT TIME ZONE 'UTC' || '|' || completed FROM observation_rollup_backfill_state WHERE id=1")"
+          printf 'hourly=%s\ndaily=%s\ncheckpoint=%s\n' "$hourly" "$daily" "$checkpoint"
+          test "$hourly" = '2:1:1'
+          test "$daily" = '2:1:1'
+          test "$checkpoint" = '2026-08-01 00:00:00|2026-09-01 00:00:00|f'
       - name: Create logical backup with production script
         env:
           IRCINTEL_BACKUP_DIR: /tmp/ircintel-rollup-dr-backups
@@ -156,7 +184,12 @@ jobs:
           data = json.load(open('/tmp/rollup-dr-history.json'))
           assert data['granularity'] == 'hour'
           points = data['points']
-          assert any(p['observation_count'] == 2 and p['reachable_count'] == 1 for p in points)
+          assert any(
+              p['observation_count'] == 2
+              and p['reachable_count'] == 1
+              and p['dual_stack_count'] == 1
+              for p in points
+          )
           PY
       - name: Show Core logs on failure
         if: failure()
