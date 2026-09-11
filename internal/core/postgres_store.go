@@ -13,7 +13,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-const postgresSchemaVersion = 4
+const postgresSchemaVersion = 5
 const postgresOperationTimeout = 10 * time.Second
 
 type PostgresStore struct {
@@ -147,6 +147,15 @@ CREATE INDEX IF NOT EXISTS idx_pg_network_endpoints_server ON network_endpoints(
 		if _, err := tx.Exec(ctx, `INSERT INTO schema_migrations(version) VALUES (4)`); err != nil {
 			return fmt.Errorf("record postgres migration v4: %w", err)
 		}
+		version = 4
+	}
+	if version < 5 {
+		if err := migratePostgresRollups(ctx, tx); err != nil {
+			return fmt.Errorf("apply postgres migration v5: %w", err)
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO schema_migrations(version) VALUES (5)`); err != nil {
+			return fmt.Errorf("record postgres migration v5: %w", err)
+		}
 	}
 	return tx.Commit(ctx)
 }
@@ -187,6 +196,9 @@ RETURNING id`,
 		return err
 	}
 
+	if err := refreshPostgresRollupsForObservationTx(ctx, tx, observation.ObservedAt, observation.Endpoint.Host, observation.Endpoint.Port, observation.Endpoint.TLS, observation.Result.Reachable, observation.Result.DualStackOK); err != nil {
+		return err
+	}
 	transitioned, err := persistPostgresTransitionForObservationTx(ctx, tx, observation)
 	if err != nil {
 		return err
