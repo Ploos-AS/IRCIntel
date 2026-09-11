@@ -1,0 +1,111 @@
+name: Ownership History
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  postgres-ownership-history:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: ircintel
+          POSTGRES_PASSWORD: ircintel
+          POSTGRES_DB: ircintel_ownership
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ircintel -d ircintel_ownership"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      IRCINTEL_STORAGE_BACKEND: postgres
+      IRCINTEL_DATABASE_URL: postgres://ircintel:ircintel@127.0.0.1:5432/ircintel_ownership?sslmode=disable
+      IRCINTEL_CORE_TOKEN: ownership-test-token
+      IRCINTEL_LISTEN: 127.0.0.1:18084
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+      - name: Build Core
+        run: go build -o /tmp/ircintel ./cmd/ircintel
+      - name: Start Core
+        run: |
+          /tmp/ircintel > /tmp/ircintel-ownership.log 2>&1 &
+          echo $! > /tmp/ircintel-ownership.pid
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:18084/readyz | grep -qx 'ready'; then
+              exit 0
+            fi
+            if [ "$attempt" -eq 30 ]; then
+              cat /tmp/ircintel-ownership.log
+              exit 1
+            fi
+            sleep 1
+          done
+      - name: Exercise ownership transitions through Core
+        run: |
+          auth='Authorization: Bearer ownership-test-token'
+          curl --fail --silent -X POST -H "$auth" -H 'Content-Type: application/json' \
+            --data '{"id":"net-a","name":"Network A"}' \
+            http://127.0.0.1:18084/api/v1/registry/networks
+          curl --fail --silent -X POST -H "$auth" -H 'Content-Type: application/json' \
+            --data '{"id":"net-b","name":"Network B"}' \
+            http://127.0.0.1:18084/api/v1/registry/networks
+          curl --fail --silent -X POST -H "$auth" -H 'Content-Type: application/json' \
+            --data '{"id":"server-a","network_id":"net-a","name":"Server A"}' \
+            http://127.0.0.1:18084/api/v1/registry/servers
+          curl --fail --silent -X POST -H "$auth" -H 'Content-Type: application/json' \
+            --data '{"id":"endpoint-a","server_id":"server-a","host":"irc.example","port":"6697","tls":true}' \
+            http://127.0.0.1:18084/api/v1/registry/endpoints
+          curl --fail --silent -X POST -H "$auth" -H 'Content-Type: application/json' \
+            --data '{"id":"server-a","network_id":"net-b","name":"Server A"}' \
+            http://127.0.0.1:18084/api/v1/registry/servers
+          curl --fail --silent -X POST -H "$auth" -H 'Content-Type: application/json' \
+            --data '{"id":"endpoint-a","server_id":"server-a","host":"irc-new.example","port":"6667","tls":false}' \
+            http://127.0.0.1:18084/api/v1/registry/endpoints
+      - name: Verify durable ownership intervals
+        run: |
+          docker run --rm --network host -e PGPASSWORD=ircintel postgres:17 \
+            psql -h 127.0.0.1 -U ircintel -d ircintel_ownership -At -F '|' -c \
+            "SELECT network_id,host,port,tls,(valid_to IS NULL) FROM endpoint_network_ownership WHERE endpoint_id='endpoint-a' ORDER BY valid_from" \
+            > /tmp/ownership.txt
+          cat /tmp/ownership.txt
+          test "$(wc -l < /tmp/ownership.txt)" -eq 3
+          sed -n '1p' /tmp/ownership.txt | grep -qx 'net-a|irc.example|6697|t|f'
+          sed -n '2p' /tmp/ownership.txt | grep -qx 'net-b|irc.example|6697|t|f'
+          sed -n '3p' /tmp/ownership.txt | grep -qx 'net-b|irc-new.example|6667|f|t'
+      - name: Restart Core and verify history persists
+        run: |
+          kill "$(cat /tmp/ircintel-ownership.pid)"
+          for attempt in $(seq 1 20); do
+            if ! kill -0 "$(cat /tmp/ircintel-ownership.pid)" 2>/dev/null; then break; fi
+            sleep 1
+          done
+          /tmp/ircintel > /tmp/ircintel-ownership-restart.log 2>&1 &
+          echo $! > /tmp/ircintel-ownership.pid
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:18084/readyz | grep -qx 'ready'; then break; fi
+            if [ "$attempt" -eq 30 ]; then cat /tmp/ircintel-ownership-restart.log; exit 1; fi
+            sleep 1
+          done
+          count=$(docker run --rm --network host -e PGPASSWORD=ircintel postgres:17 \
+            psql -h 127.0.0.1 -U ircintel -d ircintel_ownership -At -c \
+            "SELECT COUNT(*) FROM endpoint_network_ownership WHERE endpoint_id='endpoint-a'")
+          test "$count" -eq 3
+      - name: Show logs on failure
+        if: failure()
+        run: |
+          cat /tmp/ircintel-ownership.log 2>/dev/null || true
+          cat /tmp/ircintel-ownership-restart.log 2>/dev/null || true
+      - name: Stop Core
+        if: always()
+        run: |
+          if [ -f /tmp/ircintel-ownership.pid ]; then kill "$(cat /tmp/ircintel-ownership.pid)" 2>/dev/null || true; fi
