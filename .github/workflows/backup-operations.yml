@@ -33,6 +33,12 @@ jobs:
           echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(. /etc/os-release && echo $VERSION_CODENAME)-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list
           sudo apt-get update
           sudo apt-get install -y postgresql-client-17
+          echo '/usr/lib/postgresql/17/bin' >> "$GITHUB_PATH"
+      - name: Verify PostgreSQL 17 client selection
+        run: |
+          test "$(pg_dump --version | awk '{print $3}' | cut -d. -f1)" = '17'
+          test "$(pg_restore --version | awk '{print $3}' | cut -d. -f1)" = '17'
+          test "$(psql --version | awk '{print $3}' | cut -d. -f1)" = '17'
       - name: Seed source database
         env:
           PGPASSWORD: ircintel
