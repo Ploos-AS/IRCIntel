@@ -55,12 +55,16 @@ func main() {
 	discoveryReview := core.DiscoveryReviewHandler{Token: token, Store: store}
 	discoveryPromotion := core.DiscoveryPromotionHandler{Token: token, Store: store}
 	probePlan := core.ProbePlanHandler{Token: token, Reader: store}
+	var historicalReader core.HistoricalStatsReader
+	if reader, ok := store.(core.HistoricalStatsReader); ok { historicalReader = reader }
+	historicalStats := core.HistoricalStatsHandler{Token: token, Reader: historicalReader}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.Header().Set("Content-Type", "text/plain; charset=utf-8"); w.WriteHeader(http.StatusOK); _, _ = w.Write([]byte("ok\n")) })
 	mux.HandleFunc("GET /api/v1/version", func(w http.ResponseWriter, _ *http.Request) { w.Header().Set("Content-Type", "application/json"); _ = json.NewEncoder(w).Encode(versionResponse{Name: "IRCIntel", Version: version}) })
 	mux.Handle("GET /api/v1/observations", read)
 	mux.Handle("POST /api/v1/observations", ingest)
+	mux.Handle("GET /api/v1/history/observations", historicalStats)
 	mux.Handle("GET /api/v1/endpoints/status", status)
 	mux.Handle("GET /api/v1/networks/status", networkStatus)
 	mux.Handle("GET /api/v1/networks/incidents", networkIncidents)
