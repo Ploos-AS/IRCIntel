@@ -18,7 +18,8 @@ func TestPostgresHistoricalNetworkStatsFollowOwnershipIntervals(t *testing.T) {
 	if err != nil { t.Fatal(err) }
 	defer tx.Rollback(ctx)
 	if err := ensurePostgresNetworkOwnershipTx(ctx, tx); err != nil { t.Fatal(err) }
-	if _, err := tx.Exec(ctx, `DELETE FROM endpoint_network_ownership; DELETE FROM endpoint_network_ownership_meta;`); err != nil { t.Fatal(err) }
+	if _, err := tx.Exec(ctx, `DELETE FROM endpoint_network_ownership`); err != nil { t.Fatal(err) }
+	if _, err := tx.Exec(ctx, `DELETE FROM endpoint_network_ownership_meta`); err != nil { t.Fatal(err) }
 	if _, err := tx.Exec(ctx, `INSERT INTO endpoint_network_ownership_meta(singleton, bootstrapped_at) VALUES (TRUE, now())`); err != nil { t.Fatal(err) }
 
 	moveAt := time.Date(2026, 9, 11, 3, 0, 0, 0, time.UTC)
@@ -28,10 +29,14 @@ VALUES
  ('endpoint-a','server-a','net-old','irc.example','6697',true,'-infinity'::timestamptz,$1),
  ('endpoint-a','server-a','net-new','irc.example','6697',true,$1,NULL)`, moveAt); err != nil { t.Fatal(err) }
 	if _, err := tx.Exec(ctx, `
-INSERT INTO observation_rollups_hourly(bucket_start, endpoint_host, endpoint_port, endpoint_tls, observation_count, reachable_count, dual_stack_count)
+INSERT INTO observation_rollups_hourly(
+    bucket_start, endpoint_host, endpoint_port, endpoint_tls,
+    observation_count, reachable_count, dual_stack_count,
+    first_observed_at, last_observed_at
+)
 VALUES
- ('2026-09-11T01:00:00Z','irc.example','6697',true,10,10,8),
- ('2026-09-11T04:00:00Z','irc.example','6697',true,20,10,20)`); err != nil { t.Fatal(err) }
+ ('2026-09-11T01:00:00Z','irc.example','6697',true,10,10,8,'2026-09-11T01:00:00Z','2026-09-11T01:59:59Z'),
+ ('2026-09-11T04:00:00Z','irc.example','6697',true,20,10,20,'2026-09-11T04:00:00Z','2026-09-11T04:59:59Z')`); err != nil { t.Fatal(err) }
 	if err := tx.Commit(ctx); err != nil { t.Fatal(err) }
 
 	now := time.Date(2026, 9, 11, 6, 0, 0, 0, time.UTC)
@@ -63,15 +68,22 @@ func TestPostgresHistoricalNetworkStatsExcludeOwnershipBoundaryBucket(t *testing
 	if err != nil { t.Fatal(err) }
 	defer tx.Rollback(ctx)
 	if err := ensurePostgresNetworkOwnershipTx(ctx, tx); err != nil { t.Fatal(err) }
-	if _, err := tx.Exec(ctx, `DELETE FROM endpoint_network_ownership; DELETE FROM endpoint_network_ownership_meta; INSERT INTO endpoint_network_ownership_meta(singleton, bootstrapped_at) VALUES (TRUE, now())`); err != nil { t.Fatal(err) }
+	if _, err := tx.Exec(ctx, `DELETE FROM endpoint_network_ownership`); err != nil { t.Fatal(err) }
+	if _, err := tx.Exec(ctx, `DELETE FROM endpoint_network_ownership_meta`); err != nil { t.Fatal(err) }
+	if _, err := tx.Exec(ctx, `INSERT INTO endpoint_network_ownership_meta(singleton, bootstrapped_at) VALUES (TRUE, now())`); err != nil { t.Fatal(err) }
 	moveAt := time.Date(2026, 9, 11, 3, 30, 0, 0, time.UTC)
 	if _, err := tx.Exec(ctx, `
 INSERT INTO endpoint_network_ownership(endpoint_id, server_id, network_id, host, port, tls, valid_from, valid_to)
 VALUES
  ('endpoint-a','server-a','net-a','boundary.example','6697',true,'-infinity'::timestamptz,$1),
- ('endpoint-a','server-a','net-b','boundary.example','6697',true,$1,NULL);
-INSERT INTO observation_rollups_hourly(bucket_start, endpoint_host, endpoint_port, endpoint_tls, observation_count, reachable_count, dual_stack_count)
-VALUES ('2026-09-11T03:00:00Z','boundary.example','6697',true,10,10,10)`, moveAt); err != nil { t.Fatal(err) }
+ ('endpoint-a','server-a','net-b','boundary.example','6697',true,$1,NULL)`, moveAt); err != nil { t.Fatal(err) }
+	if _, err := tx.Exec(ctx, `
+INSERT INTO observation_rollups_hourly(
+    bucket_start, endpoint_host, endpoint_port, endpoint_tls,
+    observation_count, reachable_count, dual_stack_count,
+    first_observed_at, last_observed_at
+)
+VALUES ('2026-09-11T03:00:00Z','boundary.example','6697',true,10,10,10,'2026-09-11T03:00:00Z','2026-09-11T03:59:59Z')`); err != nil { t.Fatal(err) }
 	if err := tx.Commit(ctx); err != nil { t.Fatal(err) }
 
 	now := time.Date(2026, 9, 11, 6, 0, 0, 0, time.UTC)
