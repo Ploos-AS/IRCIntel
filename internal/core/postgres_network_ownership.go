@@ -115,12 +115,23 @@ WHERE endpoint_id = $1 AND valid_to IS NULL`, endpointID).Scan(
 	if err == nil && active.ServerID == current.ServerID && active.NetworkID == current.NetworkID && active.Host == current.Host && active.Port == current.Port && active.TLS == current.TLS {
 		return nil
 	}
-	if err == nil {
-		if !active.ValidFrom.IsZero() && !changedAt.After(active.ValidFrom) {
-			changedAt = active.ValidFrom.Add(time.Microsecond)
-		}
-		if _, err := tx.Exec(ctx, `UPDATE endpoint_network_ownership SET valid_to = $2 WHERE endpoint_id = $1 AND valid_to IS NULL`, endpointID, changedAt); err != nil { return err }
+	if errors.Is(err, pgx.ErrNoRows) {
+		// The first known registry state is a baseline, just like an upgraded
+		// pre-M4.18 registry. This preserves attribution for already collected or
+		// imported historical observations without inventing an earlier transition.
+		_, insertErr := tx.Exec(ctx, `
+INSERT INTO endpoint_network_ownership (
+    endpoint_id, server_id, network_id, host, port, tls, valid_from
+) VALUES ($1, $2, $3, $4, $5, $6, '-infinity'::timestamptz)`,
+			current.EndpointID, current.ServerID, current.NetworkID,
+			current.Host, current.Port, current.TLS,
+		)
+		return insertErr
 	}
+	if !active.ValidFrom.IsZero() && !changedAt.After(active.ValidFrom) {
+		changedAt = active.ValidFrom.Add(time.Microsecond)
+	}
+	if _, err := tx.Exec(ctx, `UPDATE endpoint_network_ownership SET valid_to = $2 WHERE endpoint_id = $1 AND valid_to IS NULL`, endpointID, changedAt); err != nil { return err }
 	_, err = tx.Exec(ctx, `
 INSERT INTO endpoint_network_ownership (
     endpoint_id, server_id, network_id, host, port, tls, valid_from
