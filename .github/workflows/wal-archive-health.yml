@@ -66,13 +66,45 @@ jobs:
           grep -qx 'wal_archive_reason=archive_stale' /tmp/stale.txt
       - name: Prove archive failures are observable
         run: |
-          docker exec ircintel-wal-health sh -c "psql -U ircintel -d ircintel_wal_health -c \"ALTER SYSTEM SET archive_command = 'false';\" && psql -U ircintel -d ircintel_wal_health -c 'SELECT pg_reload_conf(); SELECT pg_switch_wal();'"
-          for attempt in $(seq 1 30); do
-            failed="$(psql "$IRCINTEL_DATABASE_URL" -X -A -t -v ON_ERROR_STOP=1 -c 'SELECT failed_count FROM pg_stat_archiver' | tr -d '[:space:]')"
-            if [ "${failed:-0}" -gt 0 ]; then break; fi
-            if [ "$attempt" -eq 30 ]; then docker logs ircintel-wal-health; exit 1; fi
+          psql "$IRCINTEL_DATABASE_URL" -v ON_ERROR_STOP=1 <<'SQL'
+          ALTER SYSTEM SET archive_command = 'exit 1';
+          SELECT pg_reload_conf();
+          SQL
+
+          for attempt in $(seq 1 10); do
+            configured="$(psql "$IRCINTEL_DATABASE_URL" -X -A -t -v ON_ERROR_STOP=1 -c 'SHOW archive_command' | tr -d '\r')"
+            if [ "$configured" = 'exit 1' ]; then break; fi
+            if [ "$attempt" -eq 10 ]; then
+              echo "archive_command did not reload: $configured" >&2
+              exit 1
+            fi
             sleep 1
           done
+
+          baseline_failed="$(psql "$IRCINTEL_DATABASE_URL" -X -A -t -v ON_ERROR_STOP=1 -c 'SELECT failed_count FROM pg_stat_archiver' | tr -d '[:space:]')"
+          psql "$IRCINTEL_DATABASE_URL" -v ON_ERROR_STOP=1 <<'SQL'
+          INSERT INTO wal_health_qualification VALUES (2);
+          CHECKPOINT;
+          SELECT pg_switch_wal();
+          SELECT pg_switch_wal();
+          SQL
+
+          observed=false
+          for attempt in $(seq 1 60); do
+            failed="$(psql "$IRCINTEL_DATABASE_URL" -X -A -t -v ON_ERROR_STOP=1 -c 'SELECT failed_count FROM pg_stat_archiver' | tr -d '[:space:]')"
+            if [ "${failed:-0}" -gt "${baseline_failed:-0}" ]; then
+              observed=true
+              break
+            fi
+            sleep 1
+          done
+          if [ "$observed" != true ]; then
+            echo "archive failure was not observed; baseline=$baseline_failed current=${failed:-unknown}" >&2
+            psql "$IRCINTEL_DATABASE_URL" -X -A -t -v ON_ERROR_STOP=1 -c 'TABLE pg_stat_archiver'
+            docker logs ircintel-wal-health
+            exit 1
+          fi
+
           if IRCINTEL_WAL_ARCHIVE_MAX_AGE_SECONDS=300 ops/postgres/wal-archive-health.sh > /tmp/failure.txt 2>&1; then
             cat /tmp/failure.txt
             echo 'expected archive failure health check to fail' >&2
