@@ -1,0 +1,76 @@
+name: Backup Retention
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  retention:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_DEFAULT_REGION: us-east-1
+      IRCINTEL_BACKUP_S3_ENDPOINT: http://127.0.0.1:4566
+      IRCINTEL_WAL_S3_PREFIX: postgres/wal
+      IRCINTEL_BASEBACKUP_S3_PREFIX: postgres/basebackup
+      IRCINTEL_WAL_RETENTION_DAYS: '42'
+      IRCINTEL_BASEBACKUP_RETENTION_DAYS: '35'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start S3-compatible object storage
+        run: |
+          docker run -d --name ircintel-localstack -p 4566:4566 -e SERVICES=s3 localstack/localstack:4.4.0
+          for i in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:4566/_localstack/health | grep -q '"s3"'; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs ircintel-localstack
+          exit 1
+
+      - name: Create qualification bucket
+        run: aws --endpoint-url "$IRCINTEL_BACKUP_S3_ENDPOINT" s3api create-bucket --bucket ircintel-retention
+
+      - name: Apply and verify retention policy
+        run: |
+          chmod +x ops/postgres/s3-retention-policy.sh
+          out=$(ops/postgres/s3-retention-policy.sh ircintel-retention apply)
+          printf '%s\n' "$out"
+          grep -q '^retention_policy_result=ok$' <<<"$out"
+          check=$(ops/postgres/s3-retention-policy.sh ircintel-retention check)
+          grep -q '^retention_policy_result=ok$' <<<"$check"
+
+      - name: Reject unsafe PITR overlap
+        run: |
+          if IRCINTEL_WAL_RETENTION_DAYS=7 IRCINTEL_BASEBACKUP_RETENTION_DAYS=35 \
+             ops/postgres/s3-retention-policy.sh ircintel-retention check; then
+            echo 'unsafe retention policy unexpectedly accepted' >&2
+            exit 1
+          fi
+
+      - name: Verify lifecycle configuration
+        run: |
+          aws --endpoint-url "$IRCINTEL_BACKUP_S3_ENDPOINT" s3api get-bucket-lifecycle-configuration \
+            --bucket ircintel-retention --output json > /tmp/lifecycle.json
+          python3 - <<'PY'
+          import json
+          x=json.load(open('/tmp/lifecycle.json'))
+          rules={r['ID']:r for r in x['Rules']}
+          assert rules['ircintel-wal-retention']['Expiration']['Days']==42
+          assert rules['ircintel-basebackup-retention']['Expiration']['Days']==35
+          PY
+
+      - name: Diagnostics
+        if: failure()
+        run: docker logs ircintel-localstack || true
+
+      - name: Cleanup
+        if: always()
+        run: docker rm -f ircintel-localstack >/dev/null 2>&1 || true
