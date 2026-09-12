@@ -1,0 +1,146 @@
+name: Base Backup S3
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  basebackup-s3:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      AWS_ACCESS_KEY_ID: ircintel
+      AWS_SECRET_ACCESS_KEY: ircintel-secret
+      AWS_DEFAULT_REGION: us-east-1
+      IRCINTEL_BASEBACKUP_S3_BUCKET: ircintel-backups
+      IRCINTEL_BASEBACKUP_S3_PREFIX: postgres/basebackup
+      IRCINTEL_BASEBACKUP_S3_ENDPOINT: http://127.0.0.1:4566
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start S3-compatible object storage
+        run: |
+          docker run -d --name ircintel-localstack \
+            -p 4566:4566 \
+            -e SERVICES=s3 \
+            localstack/localstack:latest
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:4566/_localstack/health | grep -q '"s3"'; then
+              exit 0
+            fi
+            if [ "$attempt" -eq 30 ]; then
+              docker logs ircintel-localstack
+              exit 1
+            fi
+            sleep 1
+          done
+
+      - name: Create backup bucket
+        run: |
+          aws --endpoint-url "$IRCINTEL_BASEBACKUP_S3_ENDPOINT" s3api create-bucket \
+            --bucket "$IRCINTEL_BASEBACKUP_S3_BUCKET"
+
+      - name: Create PostgreSQL 17 base backup fixture
+        run: |
+          set -euo pipefail
+          docker run -d --name ircintel-basebackup-source \
+            -e POSTGRES_USER=ircintel \
+            -e POSTGRES_PASSWORD=ircintel \
+            -e POSTGRES_DB=ircintel \
+            postgres:17
+
+          for attempt in $(seq 1 30); do
+            if docker exec ircintel-basebackup-source psql -U ircintel -d ircintel -Atc 'SELECT 1' 2>/dev/null | grep -qx '1'; then
+              break
+            fi
+            if [ "$attempt" -eq 30 ]; then
+              docker logs ircintel-basebackup-source
+              exit 1
+            fi
+            sleep 1
+          done
+
+          docker exec ircintel-basebackup-source psql -U ircintel -d ircintel -v ON_ERROR_STOP=1 -c \
+            "CREATE TABLE backup_qualification(id integer PRIMARY KEY, marker text NOT NULL); INSERT INTO backup_qualification VALUES (1, 'm4.30');"
+
+          docker exec ircintel-basebackup-source rm -rf /tmp/m430-base
+          docker exec ircintel-basebackup-source pg_basebackup \
+            -U ircintel \
+            -D /tmp/m430-base \
+            -Fp \
+            -Xs \
+            -P
+
+          mkdir -p /tmp/ircintel-m430
+          docker cp ircintel-basebackup-source:/tmp/m430-base/. /tmp/ircintel-m430/base/
+          sudo chown -R "$(id -u):$(id -g)" /tmp/ircintel-m430/base
+          tar -C /tmp/ircintel-m430 -czf /tmp/ircintel-m430-base.tar.gz base
+          test -s /tmp/ircintel-m430-base.tar.gz
+          tar -tzf /tmp/ircintel-m430-base.tar.gz | grep -q '^base/PG_VERSION$'
+
+      - name: Qualify upload and idempotency
+        run: |
+          set -euo pipefail
+          chmod +x ops/postgres/basebackup-s3.sh
+          output="$(ops/postgres/basebackup-s3.sh \
+            /tmp/ircintel-m430-base.tar.gz \
+            m430-base.tar.gz)"
+          printf '%s\n' "$output"
+          printf '%s\n' "$output" | grep -qx 'basebackup_transfer_result=uploaded'
+          printf '%s\n' "$output" | grep -qx 'basebackup_key=postgres/basebackup/m430-base.tar.gz'
+
+          output="$(ops/postgres/basebackup-s3.sh \
+            /tmp/ircintel-m430-base.tar.gz \
+            m430-base.tar.gz)"
+          printf '%s\n' "$output"
+          printf '%s\n' "$output" | grep -qx 'basebackup_transfer_result=already_present'
+
+      - name: Prove collision fails closed
+        run: |
+          set -euo pipefail
+          printf 'not-the-original-base-backup\n' > /tmp/ircintel-m430-collision.tar.gz
+          if ops/postgres/basebackup-s3.sh \
+            /tmp/ircintel-m430-collision.tar.gz \
+            m430-base.tar.gz; then
+            echo 'expected mismatched existing base backup object to fail closed' >&2
+            exit 1
+          fi
+
+      - name: Verify stored object integrity metadata
+        run: |
+          set -euo pipefail
+          expected_sha="$(sha256sum /tmp/ircintel-m430-base.tar.gz | awk '{print $1}')"
+          expected_size="$(stat -c '%s' /tmp/ircintel-m430-base.tar.gz)"
+          actual_sha="$(aws --endpoint-url "$IRCINTEL_BASEBACKUP_S3_ENDPOINT" s3api head-object \
+            --bucket "$IRCINTEL_BASEBACKUP_S3_BUCKET" \
+            --key postgres/basebackup/m430-base.tar.gz \
+            --query 'Metadata.sha256' \
+            --output text)"
+          actual_size="$(aws --endpoint-url "$IRCINTEL_BASEBACKUP_S3_ENDPOINT" s3api head-object \
+            --bucket "$IRCINTEL_BASEBACKUP_S3_BUCKET" \
+            --key postgres/basebackup/m430-base.tar.gz \
+            --query 'Metadata."size-bytes"' \
+            --output text)"
+          actual_kind="$(aws --endpoint-url "$IRCINTEL_BASEBACKUP_S3_ENDPOINT" s3api head-object \
+            --bucket "$IRCINTEL_BASEBACKUP_S3_BUCKET" \
+            --key postgres/basebackup/m430-base.tar.gz \
+            --query 'Metadata.kind' \
+            --output text)"
+          test "$actual_sha" = "$expected_sha"
+          test "$actual_size" = "$expected_size"
+          test "$actual_kind" = 'postgres-base-backup'
+
+      - name: Show service logs on failure
+        if: failure()
+        run: |
+          docker logs ircintel-basebackup-source 2>/dev/null || true
+          docker logs ircintel-localstack 2>/dev/null || true
+
+      - name: Stop qualification services
+        if: always()
+        run: |
+          docker rm -f ircintel-basebackup-source 2>/dev/null || true
+          docker rm -f ircintel-localstack 2>/dev/null || true
