@@ -79,7 +79,8 @@ jobs:
           sudo chown -R "$(id -u):$(id -g)" /tmp/ircintel-m430/base
           tar -C /tmp/ircintel-m430 -czf /tmp/ircintel-m430-base.tar.gz base
           test -s /tmp/ircintel-m430-base.tar.gz
-          tar -tzf /tmp/ircintel-m430-base.tar.gz | grep -q '^base/PG_VERSION$'
+          tar -tzf /tmp/ircintel-m430-base.tar.gz > /tmp/ircintel-m430-base.contents
+          grep -qx '^base/PG_VERSION$' /tmp/ircintel-m430-base.contents
 
       - name: Qualify upload and idempotency
         run: |
