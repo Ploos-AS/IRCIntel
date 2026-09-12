@@ -3,13 +3,22 @@ name: PITR Restore
 on:
   push:
   pull_request:
+  workflow_dispatch:
+  schedule:
+    # Weekly recovery drill. UTC avoids DST-dependent scheduling.
+    - cron: '17 3 * * 0'
 
 permissions:
   contents: read
 
+concurrency:
+  group: pitr-restore-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   postgres-pitr-restore:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - name: Qualify PostgreSQL 17 point-in-time recovery
@@ -91,6 +100,16 @@ jobs:
           printf 'recovered=<%s> target=<%s>\n' "$rows" "$target"
           test "$rows" = '1:base,2:before-target'
           docker exec pitr-restored psql -U ircintel -d ircintel -Atc 'SELECT pg_is_in_recovery()' | grep -qx 'f'
+
+          {
+            echo '## PITR recovery drill'
+            echo
+            echo "- trigger: ${{ github.event_name }}"
+            echo '- PostgreSQL: 17'
+            echo "- recovered rows: $rows"
+            echo "- target: $target"
+            echo '- result: PASS'
+          } >> "$GITHUB_STEP_SUMMARY"
       - name: Show recovery logs on failure
         if: failure()
         run: |
