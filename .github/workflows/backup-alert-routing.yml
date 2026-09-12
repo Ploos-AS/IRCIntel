@@ -1,0 +1,102 @@
+name: Backup Alert Routing
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  alert-routing:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start webhook receiver
+        run: |
+          set -euo pipefail
+          cat > /tmp/ircintel-webhook.py <<'PY'
+          import http.server, json
+          from pathlib import Path
+
+          out = Path('/tmp/ircintel-alert.json')
+          class Handler(http.server.BaseHTTPRequestHandler):
+              def do_POST(self):
+                  n = int(self.headers.get('Content-Length', '0'))
+                  body = self.rfile.read(n)
+                  obj = json.loads(body)
+                  out.write_text(json.dumps(obj))
+                  self.send_response(204)
+                  self.end_headers()
+              def log_message(self, fmt, *args):
+                  pass
+          http.server.ThreadingHTTPServer(('127.0.0.1', 18080), Handler).serve_forever()
+          PY
+          python3 /tmp/ircintel-webhook.py >/tmp/ircintel-webhook.log 2>&1 &
+          echo $! >/tmp/ircintel-webhook.pid
+          for i in $(seq 1 30); do
+            if curl -sS -o /dev/null http://127.0.0.1:18080/ 2>/dev/null; then break; fi
+            sleep 1
+          done
+
+      - name: Deliver critical WAL alert
+        env:
+          IRCINTEL_BACKUP_ALERT_WEBHOOK_URL: http://127.0.0.1:18080/alerts
+          IRCINTEL_BACKUP_ALERT_SOURCE: ircintel-postgres
+          IRCINTEL_ENVIRONMENT: qualification
+        run: |
+          set -euo pipefail
+          chmod +x ops/postgres/backup-alert.sh
+          out=$(ops/postgres/backup-alert.sh wal.archive.failed critical 'WAL archive health check failed')
+          echo "$out"
+          grep -qx 'backup_alert_result=delivered' <<<"$out"
+          python3 - <<'PY'
+          import json, time
+          from pathlib import Path
+          p=Path('/tmp/ircintel-alert.json')
+          for _ in range(50):
+              if p.exists(): break
+              time.sleep(.1)
+          obj=json.loads(p.read_text())
+          assert obj['schema']=='ircintel.backup-alert.v1'
+          assert obj['event']=='wal.archive.failed'
+          assert obj['severity']=='critical'
+          assert obj['message']=='WAL archive health check failed'
+          assert obj['source']=='ircintel-postgres'
+          assert obj['environment']=='qualification'
+          assert obj['timestamp'].endswith('Z')
+          PY
+
+      - name: Reject invalid or missing routing configuration
+        run: |
+          set -euo pipefail
+          if IRCINTEL_BACKUP_ALERT_WEBHOOK_URL=http://127.0.0.1:18080 ops/postgres/backup-alert.sh backup.failed info test; then
+            echo 'invalid severity unexpectedly accepted' >&2
+            exit 1
+          fi
+          if env -u IRCINTEL_BACKUP_ALERT_WEBHOOK_URL ops/postgres/backup-alert.sh restore.failed critical test; then
+            echo 'missing webhook unexpectedly accepted' >&2
+            exit 1
+          fi
+
+      - name: Fail closed on receiver error
+        env:
+          IRCINTEL_BACKUP_ALERT_WEBHOOK_URL: http://127.0.0.1:18081/alerts
+          IRCINTEL_BACKUP_ALERT_TIMEOUT_SECONDS: 1
+        run: |
+          set -euo pipefail
+          if ops/postgres/backup-alert.sh backup.upload.failed critical 'off-host backup upload failed'; then
+            echo 'delivery failure unexpectedly accepted' >&2
+            exit 1
+          fi
+
+      - name: Diagnostics
+        if: failure()
+        run: cat /tmp/ircintel-webhook.log || true
+
+      - name: Cleanup
+        if: always()
+        run: |
+          test ! -f /tmp/ircintel-webhook.pid || kill "$(cat /tmp/ircintel-webhook.pid)" 2>/dev/null || true
