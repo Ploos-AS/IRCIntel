@@ -33,7 +33,7 @@ jobs:
             postgres:17 \
             -c wal_level=replica \
             -c archive_mode=on \
-            -c "archive_command=mkdir -p /var/lib/postgresql/data/wal-archive && test ! -f /var/lib/postgresql/data/wal-archive/%f && cp %p /var/lib/postgresql/data/wal-archive/%f"
+            -c "archive_command=test ! -f /tmp/ircintel-force-archive-failure && mkdir -p /var/lib/postgresql/data/wal-archive && test ! -f /var/lib/postgresql/data/wal-archive/%f && cp %p /var/lib/postgresql/data/wal-archive/%f"
           for attempt in $(seq 1 30); do
             if psql "$IRCINTEL_DATABASE_URL" -X -A -t -v ON_ERROR_STOP=1 -c 'SELECT 1' | grep -qx 1; then exit 0; fi
             if [ "$attempt" -eq 30 ]; then docker logs ircintel-wal-health; exit 1; fi
@@ -66,22 +66,10 @@ jobs:
           grep -qx 'wal_archive_reason=archive_stale' /tmp/stale.txt
       - name: Prove archive failures are observable
         run: |
-          psql "$IRCINTEL_DATABASE_URL" -v ON_ERROR_STOP=1 <<'SQL'
-          ALTER SYSTEM SET archive_command = 'exit 1';
-          SELECT pg_reload_conf();
-          SQL
-
-          for attempt in $(seq 1 10); do
-            configured="$(psql "$IRCINTEL_DATABASE_URL" -X -A -t -v ON_ERROR_STOP=1 -c 'SHOW archive_command' | tr -d '\r')"
-            if [ "$configured" = 'exit 1' ]; then break; fi
-            if [ "$attempt" -eq 10 ]; then
-              echo "archive_command did not reload: $configured" >&2
-              exit 1
-            fi
-            sleep 1
-          done
-
           baseline_failed="$(psql "$IRCINTEL_DATABASE_URL" -X -A -t -v ON_ERROR_STOP=1 -c 'SELECT failed_count FROM pg_stat_archiver' | tr -d '[:space:]')"
+
+          docker exec ircintel-wal-health touch /tmp/ircintel-force-archive-failure
+
           psql "$IRCINTEL_DATABASE_URL" -v ON_ERROR_STOP=1 <<'SQL'
           INSERT INTO wal_health_qualification VALUES (2);
           CHECKPOINT;
