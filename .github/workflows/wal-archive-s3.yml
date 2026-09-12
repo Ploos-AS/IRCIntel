@@ -1,0 +1,91 @@
+name: WAL Archive S3
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  wal-archive-s3:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      AWS_ACCESS_KEY_ID: ircintel
+      AWS_SECRET_ACCESS_KEY: ircintel-secret
+      AWS_DEFAULT_REGION: us-east-1
+      IRCINTEL_WAL_S3_BUCKET: ircintel-wal
+      IRCINTEL_WAL_S3_PREFIX: postgres/wal
+      IRCINTEL_WAL_S3_ENDPOINT: http://127.0.0.1:9000
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start S3-compatible object storage
+        run: |
+          docker run -d --name ircintel-minio \
+            -p 9000:9000 \
+            -e MINIO_ROOT_USER="$AWS_ACCESS_KEY_ID" \
+            -e MINIO_ROOT_PASSWORD="$AWS_SECRET_ACCESS_KEY" \
+            minio/minio:latest server /data
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:9000/minio/health/live >/dev/null; then
+              exit 0
+            fi
+            if [ "$attempt" -eq 30 ]; then
+              docker logs ircintel-minio
+              exit 1
+            fi
+            sleep 1
+          done
+
+      - name: Create archive bucket
+        run: |
+          aws --endpoint-url "$IRCINTEL_WAL_S3_ENDPOINT" s3api create-bucket \
+            --bucket "$IRCINTEL_WAL_S3_BUCKET"
+
+      - name: Qualify upload and idempotency
+        run: |
+          chmod +x ops/postgres/wal-archive-s3.sh
+          printf 'ircintel-wal-segment-a\n' > /tmp/000000010000000000000001
+
+          output="$(ops/postgres/wal-archive-s3.sh \
+            /tmp/000000010000000000000001 \
+            000000010000000000000001)"
+          printf '%s\n' "$output"
+          printf '%s\n' "$output" | grep -qx 'wal_archive_result=uploaded'
+          printf '%s\n' "$output" | grep -qx 'wal_archive_key=postgres/wal/000000010000000000000001'
+
+          output="$(ops/postgres/wal-archive-s3.sh \
+            /tmp/000000010000000000000001 \
+            000000010000000000000001)"
+          printf '%s\n' "$output"
+          printf '%s\n' "$output" | grep -qx 'wal_archive_result=already_present'
+
+      - name: Prove collision fails closed
+        run: |
+          printf 'different-payload\n' > /tmp/000000010000000000000001
+          if ops/postgres/wal-archive-s3.sh \
+            /tmp/000000010000000000000001 \
+            000000010000000000000001; then
+            echo 'expected mismatched existing WAL object to fail closed' >&2
+            exit 1
+          fi
+
+      - name: Verify stored object metadata
+        run: |
+          expected="$(printf 'ircintel-wal-segment-a\n' | sha256sum | awk '{print $1}')"
+          actual="$(aws --endpoint-url "$IRCINTEL_WAL_S3_ENDPOINT" s3api head-object \
+            --bucket "$IRCINTEL_WAL_S3_BUCKET" \
+            --key postgres/wal/000000010000000000000001 \
+            --query 'Metadata.sha256' \
+            --output text)"
+          test "$actual" = "$expected"
+
+      - name: Show object-storage logs on failure
+        if: failure()
+        run: docker logs ircintel-minio 2>/dev/null || true
+
+      - name: Stop object storage
+        if: always()
+        run: docker rm -f ircintel-minio 2>/dev/null || true
