@@ -1,0 +1,64 @@
+name: Backup Security
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  backup-security:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_DEFAULT_REGION: us-east-1
+      IRCINTEL_BACKUP_S3_ENDPOINT: http://127.0.0.1:4566
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start S3-compatible object storage
+        run: |
+          set -euo pipefail
+          docker run -d --name ircintel-localstack -p 4566:4566 -e SERVICES=s3 localstack/localstack:4.4.0
+          for i in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:4566/_localstack/health | grep -q '"s3"'; then exit 0; fi
+            sleep 1
+          done
+          docker logs ircintel-localstack
+          exit 1
+
+      - name: Qualify security policy
+        run: |
+          set -euo pipefail
+          bucket=ircintel-security
+          aws --endpoint-url "$IRCINTEL_BACKUP_S3_ENDPOINT" s3api create-bucket --bucket "$bucket"
+          chmod +x ops/postgres/s3-backup-security.sh
+          out=$(ops/postgres/s3-backup-security.sh "$bucket" apply)
+          echo "$out"
+          grep -qx 'backup_security_result=ok' <<<"$out"
+          grep -qx 'backup_encryption=AES256' <<<"$out"
+          out=$(ops/postgres/s3-backup-security.sh "$bucket" check)
+          grep -qx 'backup_security_result=ok' <<<"$out"
+
+      - name: Reject invalid encryption configuration
+        run: |
+          set -euo pipefail
+          if IRCINTEL_BACKUP_S3_ENCRYPTION=none ops/postgres/s3-backup-security.sh ircintel-security check; then
+            echo 'invalid encryption unexpectedly accepted' >&2
+            exit 1
+          fi
+          if IRCINTEL_BACKUP_S3_ENCRYPTION=aws:kms IRCINTEL_BACKUP_S3_KMS_KEY_ID= ops/postgres/s3-backup-security.sh ircintel-security check; then
+            echo 'missing KMS key unexpectedly accepted' >&2
+            exit 1
+          fi
+
+      - name: Logs on failure
+        if: failure()
+        run: docker logs ircintel-localstack || true
+
+      - name: Cleanup
+        if: always()
+        run: docker rm -f ircintel-localstack >/dev/null 2>&1 || true
