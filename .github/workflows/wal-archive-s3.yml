@@ -12,28 +12,28 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
-      AWS_ACCESS_KEY_ID: ircintel
-      AWS_SECRET_ACCESS_KEY: ircintel-secret
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
       AWS_DEFAULT_REGION: us-east-1
       IRCINTEL_WAL_S3_BUCKET: ircintel-wal
       IRCINTEL_WAL_S3_PREFIX: postgres/wal
-      IRCINTEL_WAL_S3_ENDPOINT: http://127.0.0.1:9000
+      IRCINTEL_WAL_S3_ENDPOINT: http://127.0.0.1:4566
     steps:
       - uses: actions/checkout@v4
 
       - name: Start S3-compatible object storage
         run: |
-          docker run -d --name ircintel-minio \
-            -p 9000:9000 \
-            -e MINIO_ROOT_USER="$AWS_ACCESS_KEY_ID" \
-            -e MINIO_ROOT_PASSWORD="$AWS_SECRET_ACCESS_KEY" \
-            quay.io/minio/aistor/minio:RELEASE.2026-08-07T18-34-35Z server /data
+          docker run -d --name ircintel-localstack \
+            -p 4566:4566 \
+            -e SERVICES=s3 \
+            localstack/localstack:4.8.1
           for attempt in $(seq 1 30); do
-            if curl --fail --silent http://127.0.0.1:9000/minio/health/live >/dev/null; then
+            if curl --fail --silent http://127.0.0.1:4566/_localstack/health \
+              | grep -q '"s3"'; then
               exit 0
             fi
             if [ "$attempt" -eq 30 ]; then
-              docker logs ircintel-minio
+              docker logs ircintel-localstack
               exit 1
             fi
             sleep 1
@@ -84,8 +84,8 @@ jobs:
 
       - name: Show object-storage logs on failure
         if: failure()
-        run: docker logs ircintel-minio 2>/dev/null || true
+        run: docker logs ircintel-localstack 2>/dev/null || true
 
       - name: Stop object storage
         if: always()
-        run: docker rm -f ircintel-minio 2>/dev/null || true
+        run: docker rm -f ircintel-localstack 2>/dev/null || true
