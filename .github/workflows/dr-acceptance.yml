@@ -1,0 +1,120 @@
+name: DR Acceptance
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  acceptance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    env:
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_DEFAULT_REGION: us-east-1
+      IRCINTEL_BACKUP_S3_ENDPOINT: http://127.0.0.1:4566
+      IRCINTEL_BACKUP_S3_ENCRYPTION: AES256
+      IRCINTEL_WAL_RETENTION_DAYS: '42'
+      IRCINTEL_BASEBACKUP_RETENTION_DAYS: '35'
+      IRCINTEL_BACKUP_ALERT_WEBHOOK_URL: http://127.0.0.1:18080/alert
+      IRCINTEL_ENVIRONMENT: qualification
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start S3-compatible provider
+        run: |
+          docker run -d --name ircintel-localstack -p 4566:4566 -e SERVICES=s3 localstack/localstack:4.4.0
+          for i in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:4566/_localstack/health | grep -q '"s3"'; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs ircintel-localstack
+          exit 1
+
+      - name: Start alert receiver
+        run: |
+          cat >/tmp/receiver.py <<'PY'
+          from http.server import BaseHTTPRequestHandler, HTTPServer
+          class Handler(BaseHTTPRequestHandler):
+              def do_POST(self):
+                  n=int(self.headers.get('Content-Length','0'))
+                  body=self.rfile.read(n)
+                  open('/tmp/dr-alert.json','wb').write(body)
+                  self.send_response(204)
+                  self.end_headers()
+              def log_message(self, *args):
+                  pass
+          HTTPServer(('127.0.0.1',18080),Handler).serve_forever()
+          PY
+          python3 /tmp/receiver.py >/tmp/receiver.log 2>&1 &
+          echo $! >/tmp/receiver.pid
+          for i in $(seq 1 20); do
+            if curl -s -o /dev/null http://127.0.0.1:18080/; then
+              break
+            fi
+            sleep 0.2
+          done
+
+      - name: Configure provider contract
+        run: |
+          aws --endpoint-url "$IRCINTEL_BACKUP_S3_ENDPOINT" s3api create-bucket --bucket ircintel-dr-acceptance
+          aws --endpoint-url "$IRCINTEL_BACKUP_S3_ENDPOINT" s3api put-bucket-encryption \
+            --bucket ircintel-dr-acceptance \
+            --server-side-encryption-configuration '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
+          chmod +x ops/postgres/*.sh
+          ops/postgres/s3-retention-policy.sh ircintel-dr-acceptance apply
+
+      - name: Qualify successful acceptance path
+        run: |
+          output="$(ops/postgres/dr-acceptance.sh ci ircintel-dr-acceptance)"
+          printf '%s\n' "$output"
+          printf '%s\n' "$output" | grep -qx 'dr_acceptance_mode=ci'
+          printf '%s\n' "$output" | grep -qx 'dr_acceptance_result=ok'
+
+      - name: Qualify provider failure alert path
+        run: |
+          rm -f /tmp/dr-alert.json
+          set +e
+          output=$(IRCINTEL_BACKUP_S3_ENCRYPTION=aws:kms ops/postgres/dr-acceptance.sh ci ircintel-dr-acceptance 2>&1)
+          rc=$?
+          set -e
+          printf '%s\n' "$output"
+          test "$rc" -eq 74
+          printf '%s\n' "$output" | grep -qx 'dr_acceptance_alert_delivery=delivered'
+          printf '%s\n' "$output" | grep -qx 'dr_acceptance_result=provider_failed'
+          test -s /tmp/dr-alert.json
+          python3 - <<'PY'
+          import json
+          p=json.load(open('/tmp/dr-alert.json'))
+          assert p['schema']=='ircintel.backup-alert.v1'
+          assert p['event']=='dr.provider.failed'
+          assert p['severity']=='critical'
+          assert p['environment']=='qualification'
+          PY
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo '## M4.37 DR acceptance'
+            echo
+            echo '- readiness and provider smoke orchestrated end-to-end'
+            echo '- canonical alert webhook variable enforced'
+            echo '- provider failure emits qualified critical alert'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Cleanup
+        if: always()
+        run: |
+          test ! -f /tmp/receiver.pid || kill "$(cat /tmp/receiver.pid)" >/dev/null 2>&1 || true
+          docker rm -f ircintel-localstack >/dev/null 2>&1 || true
