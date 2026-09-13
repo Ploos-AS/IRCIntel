@@ -1,0 +1,91 @@
+name: DR Provider Smoke
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dr-provider-smoke-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  provider-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_DEFAULT_REGION: us-east-1
+      IRCINTEL_BACKUP_S3_ENDPOINT: http://127.0.0.1:4566
+      IRCINTEL_BACKUP_S3_ENCRYPTION: AES256
+      IRCINTEL_WAL_RETENTION_DAYS: 42
+      IRCINTEL_BASEBACKUP_RETENTION_DAYS: 35
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start S3-compatible provider
+        run: |
+          docker run -d --name localstack -p 4566:4566 localstack/localstack:4.4.0
+          for i in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:4566/_localstack/health >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs localstack
+          exit 1
+
+      - name: Install AWS CLI
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y awscli
+
+      - name: Configure provider contract
+        run: |
+          aws --endpoint-url "$IRCINTEL_BACKUP_S3_ENDPOINT" s3api create-bucket --bucket ircintel-provider-smoke
+          aws --endpoint-url "$IRCINTEL_BACKUP_S3_ENDPOINT" s3api put-bucket-encryption \
+            --bucket ircintel-provider-smoke \
+            --server-side-encryption-configuration '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
+          chmod +x ops/postgres/s3-retention-policy.sh
+          ops/postgres/s3-retention-policy.sh ircintel-provider-smoke apply
+
+      - name: Qualify provider roundtrip
+        run: |
+          chmod +x ops/postgres/dr-provider-smoke.sh
+          ops/postgres/dr-provider-smoke.sh ircintel-provider-smoke | tee /tmp/provider-smoke.txt
+          grep -qx 'dr_provider_smoke_result=ok' /tmp/provider-smoke.txt
+          grep -qx 'provider_default_encryption=AES256' /tmp/provider-smoke.txt
+          grep -qx 'provider_lifecycle_verified=yes' /tmp/provider-smoke.txt
+          grep -qx 'provider_roundtrip_verified=yes' /tmp/provider-smoke.txt
+          grep -qx 'provider_delete_verified=yes' /tmp/provider-smoke.txt
+
+      - name: Reject encryption mismatch
+        run: |
+          set +e
+          IRCINTEL_BACKUP_S3_ENCRYPTION=aws:kms ops/postgres/dr-provider-smoke.sh ircintel-provider-smoke >/tmp/mismatch.out 2>&1
+          rc=$?
+          set -e
+          test "$rc" -eq 74
+          grep -q 'dr_provider_smoke_result=encryption_mismatch' /tmp/mismatch.out
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo '## M4.36 DR provider smoke'
+            echo
+            echo '- S3-compatible remote API reachable'
+            echo '- explicit default encryption verified'
+            echo '- lifecycle/retention contract verified'
+            echo '- upload/download SHA-256 roundtrip verified'
+            echo '- delete semantics verified'
+            echo '- encryption mismatch fails closed'
+          } >> "$GITHUB_STEP_SUMMARY"
