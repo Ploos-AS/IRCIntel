@@ -15,7 +15,7 @@ permissions:
 jobs:
   readiness:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -101,3 +101,86 @@ jobs:
           printf '%s\n' "$output" | grep -qx 'dr_readiness_mode=production'
           printf '%s\n' "$output" | grep -qx 'dr_alert_routing_configured=true'
           printf '%s\n' "$output" | grep -qx 'dr_ready=true'
+
+      - name: Start M4.37 qualification provider
+        run: |
+          docker run -d --name ircintel-m437-localstack -p 4566:4566 -e SERVICES=s3 localstack/localstack:4.4.0
+          for i in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:4566/_localstack/health | grep -q '"s3"'; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs ircintel-m437-localstack
+          exit 1
+
+      - name: Start M4.37 alert receiver
+        run: |
+          cat >/tmp/m437_receiver.py <<'PY'
+          from http.server import BaseHTTPRequestHandler, HTTPServer
+          class Handler(BaseHTTPRequestHandler):
+              def do_POST(self):
+                  n=int(self.headers.get('Content-Length','0'))
+                  open('/tmp/m437-alert.json','wb').write(self.rfile.read(n))
+                  self.send_response(204)
+                  self.end_headers()
+              def log_message(self, *args):
+                  pass
+          HTTPServer(('127.0.0.1',18080),Handler).serve_forever()
+          PY
+          python3 /tmp/m437_receiver.py >/tmp/m437_receiver.log 2>&1 &
+          echo $! >/tmp/m437_receiver.pid
+          sleep 1
+
+      - name: Configure M4.37 provider contract
+        env:
+          AWS_ACCESS_KEY_ID: test
+          AWS_SECRET_ACCESS_KEY: test
+          AWS_DEFAULT_REGION: us-east-1
+          IRCINTEL_BACKUP_S3_ENDPOINT: http://127.0.0.1:4566
+          IRCINTEL_WAL_RETENTION_DAYS: '42'
+          IRCINTEL_BASEBACKUP_RETENTION_DAYS: '35'
+        run: |
+          aws --endpoint-url "$IRCINTEL_BACKUP_S3_ENDPOINT" s3api create-bucket --bucket ircintel-m437
+          aws --endpoint-url "$IRCINTEL_BACKUP_S3_ENDPOINT" s3api put-bucket-encryption --bucket ircintel-m437 --server-side-encryption-configuration '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
+          ops/postgres/s3-retention-policy.sh ircintel-m437 apply
+
+      - name: Qualify M4.37 acceptance and alert path
+        env:
+          AWS_ACCESS_KEY_ID: test
+          AWS_SECRET_ACCESS_KEY: test
+          AWS_DEFAULT_REGION: us-east-1
+          IRCINTEL_BACKUP_S3_ENDPOINT: http://127.0.0.1:4566
+          IRCINTEL_BACKUP_S3_ENCRYPTION: AES256
+          IRCINTEL_WAL_RETENTION_DAYS: '42'
+          IRCINTEL_BASEBACKUP_RETENTION_DAYS: '35'
+          IRCINTEL_BACKUP_ALERT_WEBHOOK_URL: http://127.0.0.1:18080/alert
+          IRCINTEL_ENVIRONMENT: qualification
+        run: |
+          ok="$(ops/postgres/dr-acceptance.sh ci ircintel-m437)"
+          printf '%s\n' "$ok"
+          printf '%s\n' "$ok" | grep -qx 'dr_acceptance_result=ok'
+          rm -f /tmp/m437-alert.json
+          set +e
+          bad=$(IRCINTEL_BACKUP_S3_ENCRYPTION=aws:kms ops/postgres/dr-acceptance.sh ci ircintel-m437 2>&1)
+          rc=$?
+          set -e
+          printf '%s\n' "$bad"
+          test "$rc" -eq 74
+          printf '%s\n' "$bad" | grep -qx 'dr_acceptance_alert_delivery=delivered'
+          printf '%s\n' "$bad" | grep -qx 'dr_acceptance_result=provider_failed'
+          test -s /tmp/m437-alert.json
+          python3 - <<'PY'
+          import json
+          p=json.load(open('/tmp/m437-alert.json'))
+          assert p['schema']=='ircintel.backup-alert.v1'
+          assert p['event']=='dr.provider.failed'
+          assert p['severity']=='critical'
+          assert p['environment']=='qualification'
+          PY
+
+      - name: Cleanup M4.37 qualification
+        if: always()
+        run: |
+          test ! -f /tmp/m437_receiver.pid || kill "$(cat /tmp/m437_receiver.pid)" >/dev/null 2>&1 || true
+          docker rm -f ircintel-m437-localstack >/dev/null 2>&1 || true
