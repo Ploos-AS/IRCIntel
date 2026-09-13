@@ -16,6 +16,12 @@ jobs:
       AWS_SECRET_ACCESS_KEY: test
       AWS_DEFAULT_REGION: us-east-1
       IRCINTEL_BACKUP_S3_ENDPOINT: http://127.0.0.1:4566
+      IRCINTEL_WAL_S3_ENDPOINT: http://127.0.0.1:4566
+      IRCINTEL_BASEBACKUP_S3_ENDPOINT: http://127.0.0.1:4566
+      IRCINTEL_WAL_S3_BUCKET: ircintel-security
+      IRCINTEL_BASEBACKUP_S3_BUCKET: ircintel-security
+      IRCINTEL_WAL_S3_PREFIX: postgres/wal
+      IRCINTEL_BASEBACKUP_S3_PREFIX: postgres/basebackup
     steps:
       - uses: actions/checkout@v4
 
@@ -33,15 +39,42 @@ jobs:
       - name: Qualify security policy
         run: |
           set -euo pipefail
-          bucket=ircintel-security
+          bucket="$IRCINTEL_WAL_S3_BUCKET"
           aws --endpoint-url "$IRCINTEL_BACKUP_S3_ENDPOINT" s3api create-bucket --bucket "$bucket"
-          chmod +x ops/postgres/s3-backup-security.sh
+          chmod +x ops/postgres/s3-backup-security.sh ops/postgres/wal-archive-s3.sh ops/postgres/basebackup-s3.sh
           out=$(ops/postgres/s3-backup-security.sh "$bucket" apply)
           echo "$out"
           grep -qx 'backup_security_result=ok' <<<"$out"
           grep -qx 'backup_encryption=AES256' <<<"$out"
+          grep -qx 'default_encryption_required=yes' <<<"$out"
           out=$(ops/postgres/s3-backup-security.sh "$bucket" check)
           grep -qx 'backup_security_result=ok' <<<"$out"
+
+      - name: Qualify real uploader compatibility
+        run: |
+          set -euo pipefail
+          printf 'wal-test\n' >/tmp/000000010000000000000001
+          printf 'basebackup-test\n' >/tmp/basebackup.tar.gz
+
+          wal_out=$(ops/postgres/wal-archive-s3.sh /tmp/000000010000000000000001 000000010000000000000001)
+          echo "$wal_out"
+          grep -Eq '^wal_archive_result=(uploaded|already_present)$' <<<"$wal_out"
+
+          base_out=$(ops/postgres/basebackup-s3.sh /tmp/basebackup.tar.gz basebackup.tar.gz)
+          echo "$base_out"
+          grep -Eq '^basebackup_transfer_result=(uploaded|already_present)$' <<<"$base_out"
+
+          wal_sse=$(aws --endpoint-url "$IRCINTEL_BACKUP_S3_ENDPOINT" s3api head-object \
+            --bucket "$IRCINTEL_WAL_S3_BUCKET" \
+            --key postgres/wal/000000010000000000000001 \
+            --query ServerSideEncryption --output text)
+          base_sse=$(aws --endpoint-url "$IRCINTEL_BACKUP_S3_ENDPOINT" s3api head-object \
+            --bucket "$IRCINTEL_BASEBACKUP_S3_BUCKET" \
+            --key postgres/basebackup/basebackup.tar.gz \
+            --query ServerSideEncryption --output text)
+
+          test "$wal_sse" = AES256
+          test "$base_sse" = AES256
 
       - name: Reject invalid encryption configuration
         run: |
