@@ -43,10 +43,8 @@ jobs:
           docker logs localstack
           exit 1
 
-      - name: Install AWS CLI
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y awscli
+      - name: Verify runner AWS CLI
+        run: aws --version
 
       - name: Configure provider contract
         run: |
