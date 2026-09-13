@@ -34,9 +34,10 @@ trap 'rm -f "$enc" "$policy"' EXIT
 python3 - "$encryption" "$kms_key" >"$enc" <<'PY'
 import json, sys
 algo, key = sys.argv[1:]
-rule={"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":algo},"BucketKeyEnabled":True}
+rule={"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":algo}}
 if algo == "aws:kms":
     rule["ApplyServerSideEncryptionByDefault"]["KMSMasterKeyID"]=key
+    rule["BucketKeyEnabled"]=True
 print(json.dumps({"Rules":[rule]}, separators=(",", ":")))
 PY
 
@@ -47,8 +48,7 @@ arn=f"arn:aws:s3:::{bucket}"
 print(json.dumps({
  "Version":"2012-10-17",
  "Statement":[
-  {"Sid":"DenyInsecureTransport","Effect":"Deny","Principal":"*","Action":"s3:*","Resource":[arn,arn+"/*"],"Condition":{"Bool":{"aws:SecureTransport":"false"}}},
-  {"Sid":"DenyUnencryptedObjectUploads","Effect":"Deny","Principal":"*","Action":"s3:PutObject","Resource":arn+"/*","Condition":{"Null":{"s3:x-amz-server-side-encryption":"true"}}}
+  {"Sid":"DenyInsecureTransport","Effect":"Deny","Principal":"*","Action":"s3:*","Resource":[arn,arn+"/*"],"Condition":{"Bool":{"aws:SecureTransport":"false"}}}
  ]
 }, separators=(",", ":")))
 PY
@@ -79,12 +79,16 @@ if default.get("SSEAlgorithm") != algo:
     print("backup_security_result=encryption_mismatch"); raise SystemExit(74)
 if algo == "aws:kms" and default.get("KMSMasterKeyID") != key:
     print("backup_security_result=kms_key_mismatch"); raise SystemExit(74)
+if algo == "aws:kms" and enc[0].get("BucketKeyEnabled") is not True:
+    print("backup_security_result=bucket_key_mismatch"); raise SystemExit(74)
+if algo == "AES256" and enc[0].get("BucketKeyEnabled") is True:
+    print("backup_security_result=bucket_key_unexpected"); raise SystemExit(74)
 sids={s.get("Sid") for s in policy.get("Statement",[]) if s.get("Effect")=="Deny"}
-if not {"DenyInsecureTransport","DenyUnencryptedObjectUploads"}.issubset(sids):
+if "DenyInsecureTransport" not in sids or "DenyUnencryptedObjectUploads" in sids:
     print("backup_security_result=policy_mismatch"); raise SystemExit(74)
 print("backup_security_result=ok")
 print(f"backup_encryption={algo}")
 print("public_access_block=enabled")
 print("secure_transport_required=yes")
-print("encrypted_upload_required=yes")
+print("default_encryption_required=yes")
 PY
