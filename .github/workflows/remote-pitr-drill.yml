@@ -2,9 +2,12 @@ name: Remote PITR Drill
 
 on:
   push:
+    branches: [main]
   pull_request:
+    branches: [main]
   workflow_dispatch:
   schedule:
+    # Weekly remote recovery drill. UTC avoids DST-dependent scheduling.
     - cron: '47 3 * * 0'
 
 permissions:
