@@ -21,7 +21,7 @@ required_files=(
   ops/postgres/pitr-fetch-s3.sh
   ops/postgres/remote-pitr-drill.sh
   docs/M4_29_OFFHOST_WAL_ARCHIVE.md
-  docs/M4_30_OFFHOST_BASEBACKUP.md
+  docs/M4_30_OFFHOST_BASE_BACKUP.md
   docs/M4_31_BACKUP_RETENTION.md
   docs/M4_32_BACKUP_SECURITY.md
   docs/M4_33_PRODUCTION_ALERT_ROUTING.md
