@@ -1,0 +1,90 @@
+name: DR Readiness
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  readiness:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify CI DR contract
+        run: |
+          chmod +x ops/postgres/*.sh
+          output="$(ops/postgres/dr-readiness.sh ci)"
+          printf '%s\n' "$output"
+          printf '%s\n' "$output" | grep -qx 'dr_readiness_mode=ci'
+          printf '%s\n' "$output" | grep -qx 'dr_contract_complete=true'
+          printf '%s\n' "$output" | grep -qx 'dr_ready=true'
+
+      - name: Verify production mode fails closed without deployment inputs
+        run: |
+          if ops/postgres/dr-readiness.sh production; then
+            echo 'expected production readiness to fail without deployment inputs' >&2
+            exit 1
+          fi
+
+      - name: Verify unsafe local endpoint is rejected
+        env:
+          IRCINTEL_BASEBACKUP_S3_BUCKET: backups
+          IRCINTEL_WAL_S3_BUCKET: backups
+          IRCINTEL_BACKUP_S3_ENDPOINT: http://127.0.0.1:4566
+          IRCINTEL_BACKUP_ALERT_WEBHOOK: https://alerts.example.invalid/ircintel
+        run: |
+          if ops/postgres/dr-readiness.sh production; then
+            echo 'expected local endpoint to fail production readiness' >&2
+            exit 1
+          fi
+
+      - name: Verify retention invariant is rejected
+        env:
+          IRCINTEL_BASEBACKUP_S3_BUCKET: backups
+          IRCINTEL_WAL_S3_BUCKET: backups
+          IRCINTEL_BACKUP_S3_ENDPOINT: https://objects.example.invalid
+          IRCINTEL_BACKUP_ALERT_WEBHOOK: https://alerts.example.invalid/ircintel
+          IRCINTEL_WAL_RETENTION_DAYS: '30'
+          IRCINTEL_BASEBACKUP_RETENTION_DAYS: '35'
+        run: |
+          if ops/postgres/dr-readiness.sh production; then
+            echo 'expected invalid retention relationship to fail' >&2
+            exit 1
+          fi
+
+      - name: Verify KMS mode requires a key
+        env:
+          IRCINTEL_BASEBACKUP_S3_BUCKET: backups
+          IRCINTEL_WAL_S3_BUCKET: backups
+          IRCINTEL_BACKUP_S3_ENDPOINT: https://objects.example.invalid
+          IRCINTEL_BACKUP_ALERT_WEBHOOK: https://alerts.example.invalid/ircintel
+          IRCINTEL_BACKUP_S3_ENCRYPTION: aws:kms
+        run: |
+          if ops/postgres/dr-readiness.sh production; then
+            echo 'expected KMS mode without key to fail' >&2
+            exit 1
+          fi
+
+      - name: Verify representative production configuration passes
+        env:
+          IRCINTEL_BASEBACKUP_S3_BUCKET: ircintel-basebackup-prod
+          IRCINTEL_WAL_S3_BUCKET: ircintel-wal-prod
+          IRCINTEL_BACKUP_S3_ENDPOINT: https://objects.example.invalid
+          IRCINTEL_BACKUP_ALERT_WEBHOOK: https://alerts.example.invalid/ircintel
+          IRCINTEL_BACKUP_S3_ENCRYPTION: AES256
+          IRCINTEL_WAL_RETENTION_DAYS: '42'
+          IRCINTEL_BASEBACKUP_RETENTION_DAYS: '35'
+        run: |
+          output="$(ops/postgres/dr-readiness.sh production)"
+          printf '%s\n' "$output"
+          printf '%s\n' "$output" | grep -qx 'dr_readiness_mode=production'
+          printf '%s\n' "$output" | grep -qx 'dr_ready=true'
