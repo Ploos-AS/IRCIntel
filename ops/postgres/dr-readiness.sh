@@ -20,12 +20,14 @@ required_files=(
   ops/postgres/backup-alert.sh
   ops/postgres/pitr-fetch-s3.sh
   ops/postgres/remote-pitr-drill.sh
+  ops/postgres/dr-provider-smoke.sh
   docs/M4_29_OFFHOST_WAL_ARCHIVE.md
   docs/M4_30_OFFHOST_BASE_BACKUP.md
   docs/M4_31_BACKUP_RETENTION.md
   docs/M4_32_BACKUP_SECURITY.md
   docs/M4_33_PRODUCTION_ALERT_ROUTING.md
   docs/M4_34_REMOTE_PITR_DRILL.md
+  docs/M4_36_DR_PROVIDER_SMOKE.md
 )
 
 missing=0
@@ -59,7 +61,7 @@ failed=0
 for name in \
   IRCINTEL_BASEBACKUP_S3_BUCKET \
   IRCINTEL_WAL_S3_BUCKET \
-  IRCINTEL_BACKUP_ALERT_WEBHOOK; do
+  IRCINTEL_BACKUP_ALERT_WEBHOOK_URL; do
   require_env "$name" || failed=1
 done
 
@@ -76,7 +78,7 @@ else
   esac
 fi
 
-webhook="${IRCINTEL_BACKUP_ALERT_WEBHOOK:-}"
+webhook="${IRCINTEL_BACKUP_ALERT_WEBHOOK_URL:-}"
 if [[ -n "$webhook" && "$webhook" != https://* ]]; then
   echo "dr_readiness_webhook_requires_https=true" >&2
   failed=1
@@ -118,4 +120,5 @@ echo "dr_endpoint=$endpoint"
 echo "dr_encryption=$encryption"
 echo "dr_wal_retention_days=$wal_days"
 echo "dr_basebackup_retention_days=$base_days"
+echo "dr_alert_routing_configured=true"
 echo "dr_ready=true"
