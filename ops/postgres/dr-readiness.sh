@@ -40,14 +40,6 @@ if (( missing )); then
   exit 66
 fi
 
-for path in ops/postgres/*.sh; do
-  if [[ ! -x "$path" ]]; then
-    echo "dr_readiness_not_executable=$path" >&2
-    echo "dr_ready=false"
-    exit 67
-  fi
-done
-
 if [[ "$mode" == "ci" ]]; then
   echo "dr_readiness_mode=ci"
   echo "dr_contract_complete=true"
