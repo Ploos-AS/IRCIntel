@@ -1,0 +1,96 @@
+name: DR Evidence Archive
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  archive:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_DEFAULT_REGION: us-east-1
+      IRCINTEL_DR_EVIDENCE_S3_BUCKET: ircintel-dr-evidence
+      IRCINTEL_DR_EVIDENCE_S3_ENDPOINT: http://127.0.0.1:4566
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start S3-compatible qualification provider
+        run: |
+          docker run -d --rm --name localstack -p 4566:4566 localstack/localstack:4.4.0
+          for i in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:4566/_localstack/health >/dev/null; then exit 0; fi
+            sleep 1
+          done
+          exit 1
+
+      - name: Prepare bucket and evidence
+        run: |
+          aws --version
+          aws --endpoint-url "$IRCINTEL_DR_EVIDENCE_S3_ENDPOINT" s3api create-bucket --bucket "$IRCINTEL_DR_EVIDENCE_S3_BUCKET"
+          mkdir -p build/qualification/m4-40
+          cat > build/qualification/m4-40/dr-acceptance-20260914T170000Z.json <<'JSON'
+          {
+            "schema": "ircintel.dr-acceptance-record.v1",
+            "started_at": "2026-09-14T17:00:00Z",
+            "completed_at": "2026-09-14T17:00:01Z",
+            "mode": "ci",
+            "bucket": "qualification",
+            "result": "ok",
+            "exit_code": 0,
+            "acceptance_output_sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+          }
+          JSON
+          chmod +x ops/postgres/*.sh
+
+      - name: Archive evidence and verify roundtrip
+        run: |
+          out=$(ops/postgres/dr-evidence-s3.sh build/qualification/m4-40/dr-acceptance-20260914T170000Z.json)
+          printf '%s\n' "$out"
+          grep -q '^dr_evidence_archive_result=uploaded$' <<<"$out"
+          grep -q '^dr_evidence_archive_mode=ci$' <<<"$out"
+          grep -q '^dr_evidence_archive_acceptance_result=ok$' <<<"$out"
+
+      - name: Prove retry idempotency
+        run: |
+          out=$(ops/postgres/dr-evidence-s3.sh build/qualification/m4-40/dr-acceptance-20260914T170000Z.json)
+          printf '%s\n' "$out"
+          grep -q '^dr_evidence_archive_result=already_present$' <<<"$out"
+
+      - name: Reject immutable-key collision
+        run: |
+          python3 - <<'PY'
+          import json
+          p='build/qualification/m4-40/dr-acceptance-20260914T170000Z.json'
+          d=json.load(open(p))
+          d['result']='failed'
+          d['exit_code']=74
+          json.dump(d, open(p,'w'), sort_keys=True)
+          PY
+          set +e
+          out=$(ops/postgres/dr-evidence-s3.sh build/qualification/m4-40/dr-acceptance-20260914T170000Z.json 2>&1)
+          rc=$?
+          set -e
+          printf '%s\n' "$out"
+          test "$rc" -eq 73
+          grep -q '^dr_evidence_archive_result=collision$' <<<"$out"
+
+      - name: Reject invalid evidence record
+        run: |
+          printf '%s\n' '{"schema":"wrong"}' > build/qualification/m4-40/dr-acceptance-invalid.json
+          set +e
+          out=$(ops/postgres/dr-evidence-s3.sh build/qualification/m4-40/dr-acceptance-invalid.json 2>&1)
+          rc=$?
+          set -e
+          printf '%s\n' "$out"
+          test "$rc" -eq 65
+          grep -q '^dr_evidence_archive_result=invalid_record$' <<<"$out"
+
+      - name: Cleanup
+        if: always()
+        run: docker rm -f localstack >/dev/null 2>&1 || true
