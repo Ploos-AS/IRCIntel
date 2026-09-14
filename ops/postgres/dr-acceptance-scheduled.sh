@@ -51,7 +51,10 @@ if [[ -n "${IRCINTEL_DR_EVIDENCE_S3_BUCKET:-${IRCINTEL_BASEBACKUP_S3_BUCKET:-}}"
     echo "dr_schedule_archive_result=failed" >&2
   fi
 else
-  echo "dr_schedule_archive_result=not_configured"
+  echo "dr_schedule_archive_result=not_configured" >&2
+  if [[ "$mode" == "production" ]]; then
+    archive_rc=64
+  fi
 fi
 
 find "$evidence_dir" -maxdepth 1 -type f -name 'dr-acceptance-*.json' -mtime "+$retention_days" -print -delete || {
