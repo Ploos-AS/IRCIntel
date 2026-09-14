@@ -78,33 +78,42 @@ jobs:
 
       - name: Run complete scheduled acceptance to archive
         run: |
+          set -euo pipefail
           mkdir -p build/qualification/m4-42
-          ops/postgres/dr-integrity-chain.sh ci "$IRCINTEL_DR_EVIDENCE_S3_BUCKET" build/qualification/m4-42
+          ops/postgres/dr-integrity-chain.sh ci "$IRCINTEL_DR_EVIDENCE_S3_BUCKET" build/qualification/m4-42 \
+            | tee build/qualification/m4-42/chain-run.log
 
       - name: Verify archive metadata and exact restored evidence
         run: |
-          record=$(grep '^dr_integrity_chain_record=' build/qualification/m4-42/integrity-chain.log | cut -d= -f2-)
-          key=$(grep '^dr_integrity_chain_key=' build/qualification/m4-42/integrity-chain.log | cut -d= -f2-)
-          sha=$(grep '^dr_integrity_chain_sha256=' build/qualification/m4-42/integrity-chain.log | cut -d= -f2-)
+          set -euo pipefail
+          log=build/qualification/m4-42/chain-run.log
+          grep -q '^dr_integrity_chain_result=ok$' "$log"
+          record=$(grep '^dr_integrity_chain_record=' "$log" | tail -1 | cut -d= -f2-)
+          key=$(grep '^dr_integrity_chain_key=' "$log" | tail -1 | cut -d= -f2-)
+          sha=$(grep '^dr_integrity_chain_sha256=' "$log" | tail -1 | cut -d= -f2-)
           test -s "$record"
           test -n "$key"
           test "${#sha}" -eq 64
+          test "$(sha256sum "$record" | awk '{print $1}')" = "$sha"
           aws --endpoint-url "$IRCINTEL_DR_EVIDENCE_S3_ENDPOINT" s3api head-object --bucket "$IRCINTEL_DR_EVIDENCE_S3_BUCKET" --key "$key" >/tmp/m4-42-head.json
-          python3 - <<'PY'
-          import json
+          python3 - "$sha" <<'PY'
+          import json,sys
+          expected=sys.argv[1]
           d=json.load(open('/tmp/m4-42-head.json'))
           m=d['Metadata']
           assert m['kind']=='ircintel-dr-acceptance-evidence'
           assert m['mode']=='ci'
           assert m['result']=='ok'
-          assert len(m['sha256'])==64
+          assert m['sha256']==expected
           assert int(m['size-bytes']) > 0
           PY
 
       - name: Prove tamper detection
         run: |
-          record=$(grep '^dr_integrity_chain_record=' build/qualification/m4-42/integrity-chain.log | cut -d= -f2-)
-          key=$(grep '^dr_integrity_chain_key=' build/qualification/m4-42/integrity-chain.log | cut -d= -f2-)
+          set -euo pipefail
+          log=build/qualification/m4-42/chain-run.log
+          record=$(grep '^dr_integrity_chain_record=' "$log" | tail -1 | cut -d= -f2-)
+          key=$(grep '^dr_integrity_chain_key=' "$log" | tail -1 | cut -d= -f2-)
           cp "$record" build/qualification/m4-42/tampered.json
           python3 - <<'PY'
           import json
@@ -131,7 +140,7 @@ jobs:
           retention-days: 30
 
       - name: Summary
-        if: always()
+        if: success()
         run: |
           {
             echo '## M4.42 DR integrity chain'
@@ -140,7 +149,7 @@ jobs:
             echo '- off-host archive: PASS'
             echo '- restore: PASS'
             echo '- SHA-256 identity: PASS'
-            echo '- tamper detection: PASS'
+            echo '- tamper comparison: PASS'
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Cleanup
