@@ -59,7 +59,13 @@ jobs:
           grep -q '^dr_schedule_archive_result=ok$' /tmp/m439-success.log
           grep -q '^dr_schedule_archive_configured=yes$' /tmp/m439-success.log
           test "$(find build/qualification/m4-39 -maxdepth 1 -name 'dr-acceptance-*.json' | wc -l)" -eq 1
-          test "$(aws --endpoint-url "$IRCINTEL_BACKUP_S3_ENDPOINT" s3api list-objects-v2 --bucket "$IRCINTEL_DR_EVIDENCE_S3_BUCKET" --prefix postgres/dr-evidence/ --query 'KeyCount' --output text)" -ge 1
+          evidence_file=$(sed -n 's/^dr_schedule_evidence=//p' /tmp/m439-success.log | tail -n1)
+          test -n "$evidence_file"
+          evidence_key="postgres/dr-evidence/$(basename "$evidence_file")"
+          aws --endpoint-url "$IRCINTEL_BACKUP_S3_ENDPOINT" s3api head-object \
+            --bucket "$IRCINTEL_DR_EVIDENCE_S3_BUCKET" \
+            --key "$evidence_key" >/tmp/m440-head.json
+          test "$(python3 -c 'import json; d=json.load(open("/tmp/m440-head.json")); print(d.get("Metadata",{}).get("sha256", ""))')" = "$(sha256sum "$evidence_file" | awk '{print $1}')"
 
       - name: Qualify failure verdict preservation
         run: |
