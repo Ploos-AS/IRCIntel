@@ -1,0 +1,101 @@
+name: DR Acceptance Scheduled
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  scheduled:
+    runs-on: ubuntu-latest
+    env:
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_DEFAULT_REGION: us-east-1
+      IRCINTEL_BACKUP_S3_ENDPOINT: http://127.0.0.1:4566
+      IRCINTEL_BACKUP_S3_ENCRYPTION: AES256
+      IRCINTEL_WAL_RETENTION_DAYS: '42'
+      IRCINTEL_BASEBACKUP_RETENTION_DAYS: '35'
+      IRCINTEL_BASEBACKUP_S3_BUCKET: ircintel-m439
+      IRCINTEL_WAL_S3_BUCKET: ircintel-m439
+      IRCINTEL_BACKUP_ALERT_WEBHOOK_URL: http://127.0.0.1:18080/alert
+      IRCINTEL_DR_EVIDENCE_RETENTION_DAYS: '30'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start S3-compatible provider
+        run: |
+          docker run -d --name localstack -p 4566:4566 -e SERVICES=s3 localstack/localstack:4.4.0
+          for i in $(seq 1 60); do curl -fsS http://127.0.0.1:4566/_localstack/health >/dev/null && break; sleep 1; done
+
+      - name: Start alert receiver
+        run: |
+          cat > /tmp/receiver.py <<'PY'
+          from http.server import BaseHTTPRequestHandler, HTTPServer
+          class H(BaseHTTPRequestHandler):
+              def do_POST(self):
+                  n=int(self.headers.get('content-length','0')); self.rfile.read(n)
+                  self.send_response(204); self.end_headers()
+              def log_message(self, *args): pass
+          HTTPServer(('127.0.0.1',18080),H).serve_forever()
+          PY
+          python3 /tmp/receiver.py &
+
+      - name: Configure provider contract
+        run: |
+          aws --endpoint-url "$IRCINTEL_BACKUP_S3_ENDPOINT" s3api create-bucket --bucket "$IRCINTEL_BASEBACKUP_S3_BUCKET"
+          aws --endpoint-url "$IRCINTEL_BACKUP_S3_ENDPOINT" s3api put-bucket-encryption --bucket "$IRCINTEL_BASEBACKUP_S3_BUCKET" --server-side-encryption-configuration '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
+          chmod +x ops/postgres/*.sh
+          ops/postgres/s3-retention-policy.sh "$IRCINTEL_BASEBACKUP_S3_BUCKET" apply
+
+      - name: Qualify scheduled success path
+        run: |
+          mkdir -p build/qualification/m4-39
+          ops/postgres/dr-acceptance-scheduled.sh ci "$IRCINTEL_BASEBACKUP_S3_BUCKET" build/qualification/m4-39 | tee /tmp/m439-success.log
+          grep -q '^dr_schedule_result=ok$' /tmp/m439-success.log
+          test "$(find build/qualification/m4-39 -maxdepth 1 -name 'dr-acceptance-*.json' | wc -l)" -eq 1
+
+      - name: Qualify failure verdict preservation
+        run: |
+          set +e
+          IRCINTEL_BACKUP_S3_ENCRYPTION=aws:kms ops/postgres/dr-acceptance-scheduled.sh ci "$IRCINTEL_BASEBACKUP_S3_BUCKET" build/qualification/m4-39 > /tmp/m439-failure.log 2>&1
+          rc=$?
+          set -e
+          cat /tmp/m439-failure.log
+          test "$rc" -eq 74
+          grep -q '^dr_schedule_result=acceptance_failed$' /tmp/m439-failure.log
+
+      - name: Qualify retention pruning
+        run: |
+          touch -d '40 days ago' build/qualification/m4-39/dr-acceptance-old.json
+          ops/postgres/dr-acceptance-scheduled.sh ci "$IRCINTEL_BASEBACKUP_S3_BUCKET" build/qualification/m4-39 >/tmp/m439-retention.log
+          test ! -e build/qualification/m4-39/dr-acceptance-old.json
+          grep -q '^dr_schedule_retention_days=30$' /tmp/m439-retention.log
+
+      - name: Qualify overlap lock
+        run: |
+          exec 9>build/qualification/m4-39/.dr-acceptance.lock
+          flock -n 9
+          set +e
+          ops/postgres/dr-acceptance-scheduled.sh ci "$IRCINTEL_BASEBACKUP_S3_BUCKET" build/qualification/m4-39 > /tmp/m439-lock.log 2>&1
+          rc=$?
+          set -e
+          test "$rc" -eq 75
+          grep -q '^dr_schedule_result=already_running$' /tmp/m439-lock.log
+
+      - name: Upload qualification evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: m4-39-dr-scheduled-evidence
+          path: build/qualification/m4-39/*.json
+          retention-days: 30
+
+      - name: Summary
+        run: |
+          echo '### M4.39 scheduled DR acceptance' >> "$GITHUB_STEP_SUMMARY"
+          echo '- unattended runner: PASS' >> "$GITHUB_STEP_SUMMARY"
+          echo '- failure verdict preservation: PASS' >> "$GITHUB_STEP_SUMMARY"
+          echo '- overlap lock: PASS' >> "$GITHUB_STEP_SUMMARY"
+          echo '- evidence retention: PASS' >> "$GITHUB_STEP_SUMMARY"
