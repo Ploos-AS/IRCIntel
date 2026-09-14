@@ -1,0 +1,67 @@
+name: DR Evidence Restore
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  restore:
+    runs-on: ubuntu-latest
+    env:
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_DEFAULT_REGION: us-east-1
+      IRCINTEL_BACKUP_S3_ENDPOINT: http://127.0.0.1:4566
+      IRCINTEL_DR_EVIDENCE_KEY: evidence/m4-41/known-good.json
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start S3-compatible provider
+        run: |
+          docker run -d --name localstack -p 4566:4566 -e SERVICES=s3 localstack/localstack:4.4.0
+          for i in $(seq 1 60); do curl -fsS http://127.0.0.1:4566/_localstack/health >/dev/null && break; sleep 1; done
+
+      - name: Configure bucket and known-good evidence
+        run: |
+          aws --endpoint-url "$IRCINTEL_BACKUP_S3_ENDPOINT" s3api create-bucket --bucket ircintel-m4-41
+          printf '%s\n' '{"schema":"ircintel.dr-acceptance-record.v1","result":"ok","exit_code":0}' > /tmp/known-good.json
+          aws --endpoint-url "$IRCINTEL_BACKUP_S3_ENDPOINT" s3api put-object --bucket ircintel-m4-41 --key "$IRCINTEL_DR_EVIDENCE_KEY" --body /tmp/known-good.json
+
+      - name: Restore and verify known-good evidence
+        run: |
+          mkdir -p build/qualification/m4-41
+          chmod +x ops/postgres/dr-evidence-restore-verify.sh
+          ops/postgres/dr-evidence-restore-verify.sh ircintel-m4-41 "$IRCINTEL_DR_EVIDENCE_KEY" build/qualification/m4-41/restore.json
+          python3 - <<'PY'
+          import hashlib, json
+          d=json.load(open('build/qualification/m4-41/restore.json'))
+          expected=b'{"schema":"ircintel.dr-acceptance-record.v1","result":"ok","exit_code":0}\n'
+          assert d['schema']=='ircintel.dr-evidence-restore.v1'
+          assert d['result']=='ok'
+          assert d['restored_size']==len(expected)
+          assert d['restored_sha256']==hashlib.sha256(expected).hexdigest()
+          PY
+
+      - name: Prove missing object fails
+        run: |
+          set +e
+          ops/postgres/dr-evidence-restore-verify.sh ircintel-m4-41 evidence/m4-41/missing.json build/qualification/m4-41/missing.json >/tmp/missing.log 2>&1
+          rc=$?
+          set -e
+          test "$rc" -ne 0
+
+      - name: Upload qualification evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: m4-41-dr-evidence-restore
+          path: build/qualification/m4-41/*.json
+          retention-days: 30
+
+      - name: Summary
+        run: |
+          echo '### M4.41 DR evidence restore' >> "$GITHUB_STEP_SUMMARY"
+          echo '- restore + hash verification: PASS' >> "$GITHUB_STEP_SUMMARY"
+          echo '- missing-object failure: PASS' >> "$GITHUB_STEP_SUMMARY"
