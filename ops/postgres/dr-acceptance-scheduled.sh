@@ -36,6 +36,24 @@ ops/postgres/dr-acceptance-record.sh "$mode" "$bucket" "$out"
 rc=$?
 set -e
 
+archive_rc=0
+archive_configured=no
+if [[ -n "${IRCINTEL_DR_EVIDENCE_S3_BUCKET:-${IRCINTEL_BASEBACKUP_S3_BUCKET:-}}" ]]; then
+  archive_configured=yes
+  set +e
+  archive_out=$(ops/postgres/dr-evidence-s3.sh "$out" 2>&1)
+  archive_rc=$?
+  set -e
+  printf '%s\n' "$archive_out"
+  if (( archive_rc == 0 )); then
+    echo "dr_schedule_archive_result=ok"
+  else
+    echo "dr_schedule_archive_result=failed" >&2
+  fi
+else
+  echo "dr_schedule_archive_result=not_configured"
+fi
+
 find "$evidence_dir" -maxdepth 1 -type f -name 'dr-acceptance-*.json' -mtime "+$retention_days" -print -delete || {
   echo "dr_schedule_retention_result=failed" >&2
   exit 74
@@ -44,9 +62,16 @@ find "$evidence_dir" -maxdepth 1 -type f -name 'dr-acceptance-*.json' -mtime "+$
 echo "dr_schedule_mode=$mode"
 echo "dr_schedule_evidence=$out"
 echo "dr_schedule_retention_days=$retention_days"
-if (( rc == 0 )); then
-  echo "dr_schedule_result=ok"
-else
+echo "dr_schedule_archive_configured=$archive_configured"
+
+if (( rc != 0 )); then
   echo "dr_schedule_result=acceptance_failed"
+  exit "$rc"
 fi
-exit "$rc"
+
+if (( archive_rc != 0 )); then
+  echo "dr_schedule_result=archive_failed"
+  exit "$archive_rc"
+fi
+
+echo "dr_schedule_result=ok"
