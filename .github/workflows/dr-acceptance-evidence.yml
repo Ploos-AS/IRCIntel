@@ -1,0 +1,91 @@
+name: DR Acceptance Evidence
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  evidence:
+    runs-on: ubuntu-latest
+    env:
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_DEFAULT_REGION: us-east-1
+      IRCINTEL_BACKUP_S3_ENDPOINT: http://127.0.0.1:4566
+      IRCINTEL_BACKUP_S3_ENCRYPTION: AES256
+      IRCINTEL_WAL_RETENTION_DAYS: '42'
+      IRCINTEL_BASEBACKUP_RETENTION_DAYS: '35'
+      IRCINTEL_BASEBACKUP_S3_BUCKET: ircintel-acceptance-evidence
+      IRCINTEL_WAL_S3_BUCKET: ircintel-acceptance-evidence
+      IRCINTEL_BACKUP_ALERT_WEBHOOK_URL: http://127.0.0.1:18080/alert
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start S3-compatible provider
+        run: |
+          docker run -d --name localstack -p 4566:4566 -e SERVICES=s3 localstack/localstack:4.4.0
+          for i in $(seq 1 60); do curl -fsS http://127.0.0.1:4566/_localstack/health >/dev/null && break; sleep 1; done
+
+      - name: Start alert receiver
+        run: |
+          cat > /tmp/receiver.py <<'PY'
+          from http.server import BaseHTTPRequestHandler, HTTPServer
+          class H(BaseHTTPRequestHandler):
+              def do_POST(self):
+                  n=int(self.headers.get('content-length','0')); self.rfile.read(n)
+                  self.send_response(204); self.end_headers()
+              def log_message(self, *args): pass
+          HTTPServer(('127.0.0.1',18080),H).serve_forever()
+          PY
+          python3 /tmp/receiver.py &
+
+      - name: Configure provider contract
+        run: |
+          aws --endpoint-url "$IRCINTEL_BACKUP_S3_ENDPOINT" s3api create-bucket --bucket "$IRCINTEL_BASEBACKUP_S3_BUCKET"
+          aws --endpoint-url "$IRCINTEL_BACKUP_S3_ENDPOINT" s3api put-bucket-encryption --bucket "$IRCINTEL_BASEBACKUP_S3_BUCKET" --server-side-encryption-configuration '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
+          chmod +x ops/postgres/*.sh
+          ops/postgres/s3-retention-policy.sh "$IRCINTEL_BASEBACKUP_S3_BUCKET" apply
+
+      - name: Qualify successful evidence
+        run: |
+          mkdir -p build/qualification/m4-38
+          ops/postgres/dr-acceptance-record.sh "$IRCINTEL_BASEBACKUP_S3_BUCKET" build/qualification/m4-38/success.json
+          python3 - <<'PY'
+          import json
+          p='build/qualification/m4-38/success.json'; d=json.load(open(p))
+          assert d['schema']=='ircintel.dr-acceptance-record.v1'
+          assert d['result']=='ok' and d['exit_code']==0
+          assert len(d['acceptance_output_sha256'])==64
+          PY
+
+      - name: Qualify failed evidence preserves verdict
+        run: |
+          set +e
+          IRCINTEL_BACKUP_S3_ENCRYPTION=aws:kms ops/postgres/dr-acceptance-record.sh "$IRCINTEL_BASEBACKUP_S3_BUCKET" build/qualification/m4-38/failure.json
+          rc=$?
+          set -e
+          test "$rc" -eq 74
+          python3 - <<'PY'
+          import json
+          d=json.load(open('build/qualification/m4-38/failure.json'))
+          assert d['schema']=='ircintel.dr-acceptance-record.v1'
+          assert d['result']=='failed' and d['exit_code']==74
+          assert len(d['acceptance_output_sha256'])==64
+          PY
+
+      - name: Upload qualification evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: m4-38-dr-acceptance-evidence
+          path: build/qualification/m4-38/*.json
+          retention-days: 30
+
+      - name: Summary
+        run: |
+          echo '### M4.38 DR acceptance evidence' >> "$GITHUB_STEP_SUMMARY"
+          echo '- successful evidence: PASS' >> "$GITHUB_STEP_SUMMARY"
+          echo '- failed verdict evidence: PASS' >> "$GITHUB_STEP_SUMMARY"
+          echo '- durable artifact: PASS' >> "$GITHUB_STEP_SUMMARY"
