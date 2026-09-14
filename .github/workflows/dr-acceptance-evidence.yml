@@ -52,11 +52,12 @@ jobs:
       - name: Qualify successful evidence
         run: |
           mkdir -p build/qualification/m4-38
-          ops/postgres/dr-acceptance-record.sh "$IRCINTEL_BASEBACKUP_S3_BUCKET" build/qualification/m4-38/success.json
+          ops/postgres/dr-acceptance-record.sh ci "$IRCINTEL_BASEBACKUP_S3_BUCKET" build/qualification/m4-38/success.json
           python3 - <<'PY'
           import json
           p='build/qualification/m4-38/success.json'; d=json.load(open(p))
           assert d['schema']=='ircintel.dr-acceptance-record.v1'
+          assert d['mode']=='ci'
           assert d['result']=='ok' and d['exit_code']==0
           assert len(d['acceptance_output_sha256'])==64
           PY
@@ -64,7 +65,7 @@ jobs:
       - name: Qualify failed evidence preserves verdict
         run: |
           set +e
-          IRCINTEL_BACKUP_S3_ENCRYPTION=aws:kms ops/postgres/dr-acceptance-record.sh "$IRCINTEL_BASEBACKUP_S3_BUCKET" build/qualification/m4-38/failure.json
+          IRCINTEL_BACKUP_S3_ENCRYPTION=aws:kms ops/postgres/dr-acceptance-record.sh ci "$IRCINTEL_BASEBACKUP_S3_BUCKET" build/qualification/m4-38/failure.json
           rc=$?
           set -e
           test "$rc" -eq 74
@@ -72,6 +73,7 @@ jobs:
           import json
           d=json.load(open('build/qualification/m4-38/failure.json'))
           assert d['schema']=='ircintel.dr-acceptance-record.v1'
+          assert d['mode']=='ci'
           assert d['result']=='failed' and d['exit_code']==74
           assert len(d['acceptance_output_sha256'])==64
           PY
@@ -86,6 +88,6 @@ jobs:
       - name: Summary
         run: |
           echo '### M4.38 DR acceptance evidence' >> "$GITHUB_STEP_SUMMARY"
-          echo '- successful evidence: PASS' >> "$GITHUB_STEP_SUMMARY"
+          echo '- CI evidence path: PASS' >> "$GITHUB_STEP_SUMMARY"
           echo '- failed verdict evidence: PASS' >> "$GITHUB_STEP_SUMMARY"
           echo '- durable artifact: PASS' >> "$GITHUB_STEP_SUMMARY"
