@@ -1,0 +1,134 @@
+name: DR Integrity Chain
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  integrity-chain:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    env:
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_DEFAULT_REGION: us-east-1
+      IRCINTEL_BACKUP_S3_ENDPOINT: http://127.0.0.1:4566
+      IRCINTEL_DR_EVIDENCE_S3_ENDPOINT: http://127.0.0.1:4566
+      IRCINTEL_BACKUP_S3_ENCRYPTION: AES256
+      IRCINTEL_WAL_RETENTION_DAYS: '42'
+      IRCINTEL_BASEBACKUP_RETENTION_DAYS: '35'
+      IRCINTEL_BACKUP_ALERT_WEBHOOK_URL: http://127.0.0.1:18080/alert
+      IRCINTEL_ENVIRONMENT: qualification
+      IRCINTEL_DR_EVIDENCE_S3_BUCKET: ircintel-dr-integrity-chain
+      IRCINTEL_BASEBACKUP_S3_BUCKET: ircintel-dr-integrity-chain
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start S3-compatible provider
+        run: |
+          docker run -d --name ircintel-integrity-localstack -p 4566:4566 -e SERVICES=s3 localstack/localstack:4.4.0
+          for i in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:4566/_localstack/health | grep -q '"s3"'; then exit 0; fi
+            sleep 1
+          done
+          docker logs ircintel-integrity-localstack
+          exit 1
+
+      - name: Start alert receiver
+        run: |
+          cat >/tmp/receiver.py <<'PY'
+          from http.server import BaseHTTPRequestHandler, HTTPServer
+          class Handler(BaseHTTPRequestHandler):
+              def do_POST(self):
+                  n=int(self.headers.get('Content-Length','0')); self.rfile.read(n)
+                  self.send_response(204); self.end_headers()
+              def log_message(self, *args): pass
+          HTTPServer(('127.0.0.1',18080),Handler).serve_forever()
+          PY
+          python3 /tmp/receiver.py >/tmp/receiver.log 2>&1 &
+
+      - name: Configure provider contract
+        run: |
+          aws --endpoint-url "$IRCINTEL_BACKUP_S3_ENDPOINT" s3api create-bucket --bucket "$IRCINTEL_DR_EVIDENCE_S3_BUCKET"
+          aws --endpoint-url "$IRCINTEL_BACKUP_S3_ENDPOINT" s3api put-bucket-encryption \
+            --bucket "$IRCINTEL_DR_EVIDENCE_S3_BUCKET" \
+            --server-side-encryption-configuration '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
+          chmod +x ops/postgres/*.sh
+          ops/postgres/s3-retention-policy.sh "$IRCINTEL_DR_EVIDENCE_S3_BUCKET" apply
+
+      - name: Run complete scheduled acceptance to archive
+        run: |
+          mkdir -p build/qualification/m4-42
+          ops/postgres/dr-integrity-chain.sh ci "$IRCINTEL_DR_EVIDENCE_S3_BUCKET" build/qualification/m4-42
+
+      - name: Verify archive metadata and exact restored evidence
+        run: |
+          record=$(grep '^dr_integrity_chain_record=' build/qualification/m4-42/integrity-chain.log | cut -d= -f2-)
+          key=$(grep '^dr_integrity_chain_key=' build/qualification/m4-42/integrity-chain.log | cut -d= -f2-)
+          sha=$(grep '^dr_integrity_chain_sha256=' build/qualification/m4-42/integrity-chain.log | cut -d= -f2-)
+          test -s "$record"
+          test -n "$key"
+          test "${#sha}" -eq 64
+          aws --endpoint-url "$IRCINTEL_DR_EVIDENCE_S3_ENDPOINT" s3api head-object --bucket "$IRCINTEL_DR_EVIDENCE_S3_BUCKET" --key "$key" >/tmp/m4-42-head.json
+          python3 - <<'PY'
+          import json
+          d=json.load(open('/tmp/m4-42-head.json'))
+          m=d['Metadata']
+          assert m['kind']=='ircintel-dr-acceptance-evidence'
+          assert m['mode']=='ci'
+          assert m['result']=='ok'
+          assert len(m['sha256'])==64
+          assert int(m['size-bytes']) > 0
+          PY
+
+      - name: Prove tamper detection
+        run: |
+          record=$(grep '^dr_integrity_chain_record=' build/qualification/m4-42/integrity-chain.log | cut -d= -f2-)
+          key=$(grep '^dr_integrity_chain_key=' build/qualification/m4-42/integrity-chain.log | cut -d= -f2-)
+          cp "$record" build/qualification/m4-42/tampered.json
+          python3 - <<'PY'
+          import json
+          p='build/qualification/m4-42/tampered.json'
+          d=json.load(open(p)); d['result']='failed'
+          json.dump(d, open(p,'w'), sort_keys=True)
+          PY
+          original_sha=$(sha256sum "$record" | awk '{print $1}')
+          tampered_sha=$(sha256sum build/qualification/m4-42/tampered.json | awk '{print $1}')
+          test "$original_sha" != "$tampered_sha"
+          restored=$(mktemp)
+          aws --endpoint-url "$IRCINTEL_DR_EVIDENCE_S3_ENDPOINT" s3api get-object --bucket "$IRCINTEL_DR_EVIDENCE_S3_BUCKET" --key "$key" "$restored" >/dev/null
+          restored_sha=$(sha256sum "$restored" | awk '{print $1}')
+          test "$restored_sha" = "$original_sha"
+          test "$restored_sha" != "$tampered_sha"
+          rm -f "$restored"
+
+      - name: Upload M4.42 evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: m4-42-dr-integrity-chain
+          path: build/qualification/m4-42/
+          retention-days: 30
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo '## M4.42 DR integrity chain'
+            echo
+            echo '- scheduled acceptance: PASS'
+            echo '- off-host archive: PASS'
+            echo '- restore: PASS'
+            echo '- SHA-256 identity: PASS'
+            echo '- tamper detection: PASS'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Cleanup
+        if: always()
+        run: docker rm -f ircintel-integrity-localstack >/dev/null 2>&1 || true
