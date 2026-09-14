@@ -20,6 +20,7 @@ jobs:
       IRCINTEL_BASEBACKUP_RETENTION_DAYS: '35'
       IRCINTEL_BASEBACKUP_S3_BUCKET: ircintel-m439
       IRCINTEL_WAL_S3_BUCKET: ircintel-m439
+      IRCINTEL_DR_EVIDENCE_S3_BUCKET: ircintel-m439
       IRCINTEL_BACKUP_ALERT_WEBHOOK_URL: http://127.0.0.1:18080/alert
       IRCINTEL_DR_EVIDENCE_RETENTION_DAYS: '30'
     steps:
@@ -50,12 +51,15 @@ jobs:
           chmod +x ops/postgres/*.sh
           ops/postgres/s3-retention-policy.sh "$IRCINTEL_BASEBACKUP_S3_BUCKET" apply
 
-      - name: Qualify scheduled success path
+      - name: Qualify scheduled success path and off-host archive
         run: |
           mkdir -p build/qualification/m4-39
           ops/postgres/dr-acceptance-scheduled.sh ci "$IRCINTEL_BASEBACKUP_S3_BUCKET" build/qualification/m4-39 | tee /tmp/m439-success.log
           grep -q '^dr_schedule_result=ok$' /tmp/m439-success.log
+          grep -q '^dr_schedule_archive_result=ok$' /tmp/m439-success.log
+          grep -q '^dr_schedule_archive_configured=yes$' /tmp/m439-success.log
           test "$(find build/qualification/m4-39 -maxdepth 1 -name 'dr-acceptance-*.json' | wc -l)" -eq 1
+          test "$(aws --endpoint-url "$IRCINTEL_BACKUP_S3_ENDPOINT" s3api list-objects-v2 --bucket "$IRCINTEL_DR_EVIDENCE_S3_BUCKET" --prefix postgres/dr-evidence/ --query 'KeyCount' --output text)" -ge 1
 
       - name: Qualify failure verdict preservation
         run: |
@@ -66,6 +70,7 @@ jobs:
           cat /tmp/m439-failure.log
           test "$rc" -eq 74
           grep -q '^dr_schedule_result=acceptance_failed$' /tmp/m439-failure.log
+          grep -q '^dr_schedule_archive_result=ok$' /tmp/m439-failure.log
 
       - name: Qualify retention pruning
         run: |
@@ -73,6 +78,7 @@ jobs:
           ops/postgres/dr-acceptance-scheduled.sh ci "$IRCINTEL_BASEBACKUP_S3_BUCKET" build/qualification/m4-39 >/tmp/m439-retention.log
           test ! -e build/qualification/m4-39/dr-acceptance-old.json
           grep -q '^dr_schedule_retention_days=30$' /tmp/m439-retention.log
+          grep -q '^dr_schedule_archive_result=ok$' /tmp/m439-retention.log
 
       - name: Qualify overlap lock
         run: |
@@ -94,8 +100,10 @@ jobs:
 
       - name: Summary
         run: |
-          echo '### M4.39 scheduled DR acceptance' >> "$GITHUB_STEP_SUMMARY"
+          echo '### M4.40 scheduled DR acceptance archive integration' >> "$GITHUB_STEP_SUMMARY"
           echo '- unattended runner: PASS' >> "$GITHUB_STEP_SUMMARY"
+          echo '- off-host archive: PASS' >> "$GITHUB_STEP_SUMMARY"
+          echo '- failure evidence archive: PASS' >> "$GITHUB_STEP_SUMMARY"
           echo '- failure verdict preservation: PASS' >> "$GITHUB_STEP_SUMMARY"
           echo '- overlap lock: PASS' >> "$GITHUB_STEP_SUMMARY"
-          echo '- evidence retention: PASS' >> "$GITHUB_STEP_SUMMARY"
+          echo '- local evidence retention: PASS' >> "$GITHUB_STEP_SUMMARY"
