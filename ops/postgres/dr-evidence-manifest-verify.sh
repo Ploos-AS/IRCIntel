@@ -22,8 +22,10 @@ try:
     manifest=json.load(open(manifest_path,encoding='utf-8'))
     evidence=json.load(open(evidence_path,encoding='utf-8'))
     restore=json.load(open(restore_path,encoding='utf-8'))
+    manifest_size=int(manifest.get('evidence_size_bytes',-1))
+    restore_size=int(restore.get('restored_size_bytes', restore.get('restored_size',-2)))
 except Exception as exc:
-    print(f'dr_evidence_manifest_verify_result=invalid_json:{exc}',file=sys.stderr)
+    print(f'dr_evidence_manifest_verify_result=invalid_data:{exc}',file=sys.stderr)
     raise SystemExit(74)
 
 def require(ok):
@@ -39,7 +41,7 @@ require(restore.get('schema')=='ircintel.dr-evidence-restore.v1')
 require(restore.get('result')=='ok' and restore.get('metadata_verified') is True)
 require(manifest.get('evidence_key')==restore.get('source_key'))
 require(manifest.get('evidence_sha256')==sha==restore.get('restored_sha256'))
-require(int(manifest.get('evidence_size_bytes',-1))==int(size)==int(restore.get('restored_size_bytes',-2)))
+require(manifest_size==int(size)==restore_size)
 require(manifest.get('mode')==evidence.get('mode')==restore.get('archive_mode'))
 require(manifest.get('acceptance_result')==evidence.get('result')==restore.get('archive_result'))
 print('dr_evidence_manifest_verify_result=ok')
