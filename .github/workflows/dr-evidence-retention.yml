@@ -1,0 +1,91 @@
+name: DR Evidence Retention
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  retention:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_DEFAULT_REGION: us-east-1
+      IRCINTEL_DR_EVIDENCE_S3_ENDPOINT: http://127.0.0.1:4566
+      IRCINTEL_DR_EVIDENCE_S3_PREFIX: postgres/dr-evidence
+      IRCINTEL_DR_EVIDENCE_RETENTION_DAYS: '365'
+      IRCINTEL_BASEBACKUP_RETENTION_DAYS: '35'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start S3-compatible object storage
+        run: |
+          docker run -d --name ircintel-localstack -p 4566:4566 -e SERVICES=s3 localstack/localstack:4.4.0
+          for i in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:4566/_localstack/health | grep -q '"s3"'; then exit 0; fi
+            sleep 1
+          done
+          docker logs ircintel-localstack
+          exit 1
+
+      - name: Create qualification bucket and unrelated lifecycle rule
+        run: |
+          aws --endpoint-url "$IRCINTEL_DR_EVIDENCE_S3_ENDPOINT" s3api create-bucket --bucket ircintel-dr-evidence-retention
+          cat >/tmp/original.json <<'JSON'
+          {"Rules":[{"ID":"unrelated-rule","Status":"Enabled","Filter":{"Prefix":"other/"},"Expiration":{"Days":7}}]}
+          JSON
+          aws --endpoint-url "$IRCINTEL_DR_EVIDENCE_S3_ENDPOINT" s3api put-bucket-lifecycle-configuration \
+            --bucket ircintel-dr-evidence-retention --lifecycle-configuration file:///tmp/original.json
+
+      - name: Apply and verify evidence retention
+        run: |
+          chmod +x ops/postgres/dr-evidence-retention.sh
+          out=$(ops/postgres/dr-evidence-retention.sh ircintel-dr-evidence-retention apply)
+          printf '%s\n' "$out"
+          grep -q '^dr_evidence_retention_result=ok$' <<<"$out"
+          grep -q '^dr_evidence_retention_days=365$' <<<"$out"
+          check=$(ops/postgres/dr-evidence-retention.sh ircintel-dr-evidence-retention check)
+          grep -q '^dr_evidence_retention_result=ok$' <<<"$check"
+
+      - name: Preserve unrelated lifecycle rules
+        run: |
+          actual=$(aws --endpoint-url "$IRCINTEL_DR_EVIDENCE_S3_ENDPOINT" s3api get-bucket-lifecycle-configuration --bucket ircintel-dr-evidence-retention --output json)
+          python3 - "$actual" <<'PY'
+          import json,sys
+          rules={r['ID']:r for r in json.loads(sys.argv[1])['Rules']}
+          assert rules['unrelated-rule']['Expiration']['Days']==7
+          assert rules['ircintel-dr-evidence-retention']['Expiration']['Days']==365
+          assert rules['ircintel-dr-evidence-retention']['Filter']['Prefix']=='postgres/dr-evidence/'
+          PY
+
+      - name: Reject evidence retention shorter than backup window
+        run: |
+          set +e
+          IRCINTEL_DR_EVIDENCE_RETENTION_DAYS=34 ops/postgres/dr-evidence-retention.sh ircintel-dr-evidence-retention check >/tmp/unsafe.out 2>&1
+          rc=$?
+          set -e
+          cat /tmp/unsafe.out
+          test "$rc" -eq 65
+          grep -q '^dr_evidence_retention_result=unsafe_window$' /tmp/unsafe.out
+
+      - name: Reject malformed retention
+        run: |
+          set +e
+          IRCINTEL_DR_EVIDENCE_RETENTION_DAYS=0 ops/postgres/dr-evidence-retention.sh ircintel-dr-evidence-retention check >/tmp/invalid.out 2>&1
+          rc=$?
+          set -e
+          test "$rc" -eq 64
+          grep -q '^dr_evidence_retention_result=invalid_days$' /tmp/invalid.out
+
+      - name: Diagnostics
+        if: failure()
+        run: docker logs ircintel-localstack || true
+
+      - name: Cleanup
+        if: always()
+        run: docker rm -f ircintel-localstack >/dev/null 2>&1 || true
