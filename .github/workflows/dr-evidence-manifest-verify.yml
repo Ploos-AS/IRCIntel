@@ -1,0 +1,67 @@
+name: DR Evidence Manifest Verify
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build verified chain fixture
+        run: |
+          chmod +x ops/postgres/dr-evidence-manifest.sh ops/postgres/dr-evidence-manifest-verify.sh
+          printf '%s\n' '{"schema":"ircintel.dr-acceptance-record.v1","mode":"ci","result":"ok","exit_code":0}' > /tmp/evidence.json
+          sha=$(sha256sum /tmp/evidence.json | awk '{print $1}')
+          size=$(stat -c %s /tmp/evidence.json)
+          python3 - "$sha" "$size" > /tmp/restore.json <<'PY'
+          import json,sys
+          print(json.dumps({"schema":"ircintel.dr-evidence-restore.v1","source_key":"postgres/dr-evidence/m4-46.json","restored_sha256":sys.argv[1],"restored_size_bytes":int(sys.argv[2]),"archive_kind":"ircintel-dr-acceptance-evidence","archive_mode":"ci","archive_result":"ok","metadata_verified":True,"result":"ok"},separators=(',',':')))
+          PY
+          ops/postgres/dr-evidence-manifest.sh /tmp/evidence.json postgres/dr-evidence/m4-46.json /tmp/restore.json /tmp/manifest.json
+      - name: Verify complete chain
+        run: |
+          out=$(ops/postgres/dr-evidence-manifest-verify.sh /tmp/manifest.json /tmp/evidence.json /tmp/restore.json)
+          printf '%s\n' "$out"
+          grep -q '^dr_evidence_manifest_verify_result=ok$' <<<"$out"
+      - name: Reject tampered manifest hash
+        run: |
+          python3 - /tmp/manifest.json > /tmp/bad-manifest.json <<'PY'
+          import json,sys
+          x=json.load(open(sys.argv[1])); x['evidence_sha256']='0'*64; print(json.dumps(x))
+          PY
+          set +e
+          ops/postgres/dr-evidence-manifest-verify.sh /tmp/bad-manifest.json /tmp/evidence.json /tmp/restore.json
+          rc=$?
+          set -e
+          test "$rc" -eq 74
+      - name: Reject tampered evidence
+        run: |
+          cp /tmp/evidence.json /tmp/bad-evidence.json
+          printf ' ' >> /tmp/bad-evidence.json
+          set +e
+          ops/postgres/dr-evidence-manifest-verify.sh /tmp/manifest.json /tmp/bad-evidence.json /tmp/restore.json
+          rc=$?
+          set -e
+          test "$rc" -eq 74
+      - name: Reject mismatched restore key
+        run: |
+          python3 - /tmp/restore.json > /tmp/bad-restore.json <<'PY'
+          import json,sys
+          x=json.load(open(sys.argv[1])); x['source_key']='postgres/dr-evidence/other.json'; print(json.dumps(x))
+          PY
+          set +e
+          ops/postgres/dr-evidence-manifest-verify.sh /tmp/manifest.json /tmp/evidence.json /tmp/bad-restore.json
+          rc=$?
+          set -e
+          test "$rc" -eq 74
+      - uses: actions/upload-artifact@v4
+        with:
+          name: m4-46-dr-evidence-manifest-verify
+          path: /tmp/manifest.json
