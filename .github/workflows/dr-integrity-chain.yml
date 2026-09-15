@@ -9,7 +9,9 @@ on:
       - 'ops/postgres/dr-acceptance-scheduled.sh'
       - 'ops/postgres/dr-evidence-s3.sh'
       - 'ops/postgres/dr-evidence-restore-verify.sh'
-      - 'docs/M4_42_DR_INTEGRITY_CHAIN.md'
+      - 'ops/postgres/dr-evidence-manifest.sh'
+      - 'ops/postgres/dr-evidence-manifest-verify.sh'
+      - 'docs/M4_48_DR_MANIFEST_INTEGRITY_CHAIN.md'
   pull_request:
     branches: [main]
     paths:
@@ -18,7 +20,9 @@ on:
       - 'ops/postgres/dr-acceptance-scheduled.sh'
       - 'ops/postgres/dr-evidence-s3.sh'
       - 'ops/postgres/dr-evidence-restore-verify.sh'
-      - 'docs/M4_42_DR_INTEGRITY_CHAIN.md'
+      - 'ops/postgres/dr-evidence-manifest.sh'
+      - 'ops/postgres/dr-evidence-manifest-verify.sh'
+      - 'docs/M4_48_DR_MANIFEST_INTEGRITY_CHAIN.md'
   workflow_dispatch:
 
 permissions:
@@ -43,7 +47,6 @@ jobs:
       IRCINTEL_BASEBACKUP_S3_BUCKET: ircintel-dr-integrity-chain
     steps:
       - uses: actions/checkout@v4
-
       - name: Start S3-compatible provider
         run: |
           docker run -d --name ircintel-integrity-localstack -p 4566:4566 -e SERVICES=s3 localstack/localstack:4.4.0
@@ -53,7 +56,6 @@ jobs:
           done
           docker logs ircintel-integrity-localstack
           exit 1
-
       - name: Start alert receiver
         run: |
           cat >/tmp/receiver.py <<'PY'
@@ -66,92 +68,66 @@ jobs:
           HTTPServer(('127.0.0.1',18080),Handler).serve_forever()
           PY
           python3 /tmp/receiver.py >/tmp/receiver.log 2>&1 &
-
       - name: Configure provider contract
         run: |
           aws --endpoint-url "$IRCINTEL_BACKUP_S3_ENDPOINT" s3api create-bucket --bucket "$IRCINTEL_DR_EVIDENCE_S3_BUCKET"
-          aws --endpoint-url "$IRCINTEL_BACKUP_S3_ENDPOINT" s3api put-bucket-encryption \
-            --bucket "$IRCINTEL_DR_EVIDENCE_S3_BUCKET" \
-            --server-side-encryption-configuration '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
+          aws --endpoint-url "$IRCINTEL_BACKUP_S3_ENDPOINT" s3api put-bucket-encryption --bucket "$IRCINTEL_DR_EVIDENCE_S3_BUCKET" --server-side-encryption-configuration '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
           chmod +x ops/postgres/*.sh
           ops/postgres/s3-retention-policy.sh "$IRCINTEL_DR_EVIDENCE_S3_BUCKET" apply
-
-      - name: Run complete scheduled acceptance to archive
+      - name: Run manifest-integrated integrity chain
         run: |
           set -euo pipefail
-          mkdir -p build/qualification/m4-42
-          ops/postgres/dr-integrity-chain.sh ci "$IRCINTEL_DR_EVIDENCE_S3_BUCKET" build/qualification/m4-42 \
-            | tee build/qualification/m4-42/chain-run.log
-
-      - name: Verify archive metadata and exact restored evidence
+          mkdir -p build/qualification/m4-48
+          ops/postgres/dr-integrity-chain.sh ci "$IRCINTEL_DR_EVIDENCE_S3_BUCKET" build/qualification/m4-48 | tee build/qualification/m4-48/chain-run.log
+      - name: Verify manifest is generated from real restored evidence
         run: |
           set -euo pipefail
-          log=build/qualification/m4-42/chain-run.log
-          grep -q '^dr_integrity_chain_result=ok$' "$log"
+          log=build/qualification/m4-48/chain-run.log
+          grep -qx 'dr_integrity_chain_result=ok' "$log"
+          grep -qx 'dr_integrity_chain_manifest_verified=true' "$log"
           record=$(grep '^dr_integrity_chain_record=' "$log" | tail -1 | cut -d= -f2-)
-          key=$(grep '^dr_integrity_chain_key=' "$log" | tail -1 | cut -d= -f2-)
-          sha=$(grep '^dr_integrity_chain_sha256=' "$log" | tail -1 | cut -d= -f2-)
-          test -s "$record"
-          test -n "$key"
-          test "${#sha}" -eq 64
-          test "$(sha256sum "$record" | awk '{print $1}')" = "$sha"
-          aws --endpoint-url "$IRCINTEL_DR_EVIDENCE_S3_ENDPOINT" s3api head-object --bucket "$IRCINTEL_DR_EVIDENCE_S3_BUCKET" --key "$key" >/tmp/m4-42-head.json
-          python3 - "$sha" <<'PY'
-          import json,sys
-          expected=sys.argv[1]
-          d=json.load(open('/tmp/m4-42-head.json'))
-          m=d['Metadata']
-          assert m['kind']=='ircintel-dr-acceptance-evidence'
-          assert m['mode']=='ci'
-          assert m['result']=='ok'
-          assert m['sha256']==expected
-          assert int(m['size-bytes']) > 0
-          PY
-
-      - name: Prove tamper detection
+          restore=$(grep '^dr_integrity_chain_restore=' "$log" | tail -1 | cut -d= -f2-)
+          manifest=$(grep '^dr_integrity_chain_manifest=' "$log" | tail -1 | cut -d= -f2-)
+          test -s "$record"; test -s "$restore"; test -s "$manifest"
+          ops/postgres/dr-evidence-manifest-verify.sh "$manifest" "$record" "$restore"
+      - name: Prove manifest tamper detection
         run: |
           set -euo pipefail
-          log=build/qualification/m4-42/chain-run.log
+          log=build/qualification/m4-48/chain-run.log
           record=$(grep '^dr_integrity_chain_record=' "$log" | tail -1 | cut -d= -f2-)
-          key=$(grep '^dr_integrity_chain_key=' "$log" | tail -1 | cut -d= -f2-)
-          cp "$record" build/qualification/m4-42/tampered.json
+          restore=$(grep '^dr_integrity_chain_restore=' "$log" | tail -1 | cut -d= -f2-)
+          manifest=$(grep '^dr_integrity_chain_manifest=' "$log" | tail -1 | cut -d= -f2-)
+          cp "$manifest" build/qualification/m4-48/tampered-manifest.json
           python3 - <<'PY'
           import json
-          p='build/qualification/m4-42/tampered.json'
-          d=json.load(open(p)); d['result']='failed'
-          json.dump(d, open(p,'w'), sort_keys=True)
+          p='build/qualification/m4-48/tampered-manifest.json'
+          d=json.load(open(p)); d['evidence_sha256']='0'*64
+          json.dump(d,open(p,'w'),sort_keys=True)
           PY
-          original_sha=$(sha256sum "$record" | awk '{print $1}')
-          tampered_sha=$(sha256sum build/qualification/m4-42/tampered.json | awk '{print $1}')
-          test "$original_sha" != "$tampered_sha"
-          restored=$(mktemp)
-          aws --endpoint-url "$IRCINTEL_DR_EVIDENCE_S3_ENDPOINT" s3api get-object --bucket "$IRCINTEL_DR_EVIDENCE_S3_BUCKET" --key "$key" "$restored" >/dev/null
-          restored_sha=$(sha256sum "$restored" | awk '{print $1}')
-          test "$restored_sha" = "$original_sha"
-          test "$restored_sha" != "$tampered_sha"
-          rm -f "$restored"
-
-      - name: Upload M4.42 evidence
+          set +e
+          ops/postgres/dr-evidence-manifest-verify.sh build/qualification/m4-48/tampered-manifest.json "$record" "$restore"
+          rc=$?
+          set -e
+          test "$rc" -eq 74
+      - name: Upload M4.48 evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: m4-42-dr-integrity-chain
-          path: build/qualification/m4-42/
+          name: m4-48-dr-manifest-integrity-chain
+          path: build/qualification/m4-48/
           retention-days: 30
-
       - name: Summary
         if: success()
         run: |
           {
-            echo '## M4.42 DR integrity chain'
+            echo '## M4.48 DR manifest integrity chain'
             echo
-            echo '- scheduled acceptance: PASS'
-            echo '- off-host archive: PASS'
-            echo '- restore: PASS'
-            echo '- SHA-256 identity: PASS'
-            echo '- tamper comparison: PASS'
+            echo '- scheduled acceptance + archive: PASS'
+            echo '- metadata-aware restore: PASS'
+            echo '- manifest generation: PASS'
+            echo '- independent manifest verification: PASS'
+            echo '- manifest tamper detection: PASS'
           } >> "$GITHUB_STEP_SUMMARY"
-
       - name: Cleanup
         if: always()
         run: docker rm -f ircintel-integrity-localstack >/dev/null 2>&1 || true
