@@ -26,14 +26,16 @@ src_path,restore_path,key,sha,size,created,out=sys.argv[1:]
 try:
     src=json.load(open(src_path,encoding='utf-8'))
     restore=json.load(open(restore_path,encoding='utf-8'))
+    restored_size=restore.get('restored_size_bytes', restore.get('restored_size', -1))
+    restored_size=int(restored_size)
 except Exception as exc:
-    print(f'dr_evidence_manifest_result=invalid_json:{exc}', file=sys.stderr)
+    print(f'dr_evidence_manifest_result=invalid_data:{exc}', file=sys.stderr)
     raise SystemExit(74)
 if src.get('schema')!='ircintel.dr-acceptance-record.v1': raise SystemExit(74)
 if restore.get('schema')!='ircintel.dr-evidence-restore.v1': raise SystemExit(74)
 if restore.get('result')!='ok' or restore.get('metadata_verified') is not True: raise SystemExit(74)
 if restore.get('source_key')!=key: raise SystemExit(74)
-if restore.get('restored_sha256')!=sha or int(restore.get('restored_size_bytes',-1))!=int(size): raise SystemExit(74)
+if restore.get('restored_sha256')!=sha or restored_size!=int(size): raise SystemExit(74)
 if restore.get('archive_mode')!=src.get('mode') or restore.get('archive_result')!=src.get('result'): raise SystemExit(74)
 record={
  'schema':'ircintel.dr-evidence-manifest.v1','created_at':created,
