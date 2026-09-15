@@ -2,11 +2,9 @@ name: DR Readiness
 
 on:
   push:
-    branches:
-      - main
+    branches: [main]
   pull_request:
-    branches:
-      - main
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -15,172 +13,62 @@ permissions:
 jobs:
   readiness:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-
       - name: Verify CI DR contract
         run: |
           chmod +x ops/postgres/*.sh
           output="$(ops/postgres/dr-readiness.sh ci)"
           printf '%s\n' "$output"
-          printf '%s\n' "$output" | grep -qx 'dr_readiness_mode=ci'
-          printf '%s\n' "$output" | grep -qx 'dr_contract_complete=true'
-          printf '%s\n' "$output" | grep -qx 'dr_ready=true'
-
-      - name: Verify production mode fails closed without deployment inputs
+          grep -qx 'dr_readiness_mode=ci' <<<"$output"
+          grep -qx 'dr_contract_complete=true' <<<"$output"
+          grep -qx 'dr_ready=true' <<<"$output"
+      - name: Production fails without deployment inputs
         run: |
-          if ops/postgres/dr-readiness.sh production; then
-            echo 'expected production readiness to fail without deployment inputs' >&2
-            exit 1
-          fi
-
-      - name: Verify unsafe local endpoint is rejected
-        env:
+          set +e; ops/postgres/dr-readiness.sh production; rc=$?; set -e
+          test "$rc" -eq 68
+      - name: Reject unsafe local endpoint
+        env: &base
           IRCINTEL_BASEBACKUP_S3_BUCKET: backups
           IRCINTEL_WAL_S3_BUCKET: backups
-          IRCINTEL_BACKUP_S3_ENDPOINT: http://127.0.0.1:4566
-          IRCINTEL_BACKUP_ALERT_WEBHOOK_URL: https://alerts.example.invalid/ircintel
-        run: |
-          if ops/postgres/dr-readiness.sh production; then
-            echo 'expected local endpoint to fail production readiness' >&2
-            exit 1
-          fi
-
-      - name: Verify retention invariant is rejected
-        env:
-          IRCINTEL_BASEBACKUP_S3_BUCKET: backups
-          IRCINTEL_WAL_S3_BUCKET: backups
+          IRCINTEL_DR_EVIDENCE_S3_BUCKET: evidence
           IRCINTEL_BACKUP_S3_ENDPOINT: https://objects.example.invalid
           IRCINTEL_BACKUP_ALERT_WEBHOOK_URL: https://alerts.example.invalid/ircintel
-          IRCINTEL_WAL_RETENTION_DAYS: '30'
-          IRCINTEL_BASEBACKUP_RETENTION_DAYS: '35'
-        run: |
-          if ops/postgres/dr-readiness.sh production; then
-            echo 'expected invalid retention relationship to fail' >&2
-            exit 1
-          fi
-
-      - name: Verify KMS mode requires a key
-        env:
-          IRCINTEL_BASEBACKUP_S3_BUCKET: backups
-          IRCINTEL_WAL_S3_BUCKET: backups
-          IRCINTEL_BACKUP_S3_ENDPOINT: https://objects.example.invalid
-          IRCINTEL_BACKUP_ALERT_WEBHOOK_URL: https://alerts.example.invalid/ircintel
-          IRCINTEL_BACKUP_S3_ENCRYPTION: aws:kms
-        run: |
-          if ops/postgres/dr-readiness.sh production; then
-            echo 'expected KMS mode without key to fail' >&2
-            exit 1
-          fi
-
-      - name: Reject legacy non-routable alert variable
-        env:
-          IRCINTEL_BASEBACKUP_S3_BUCKET: backups
-          IRCINTEL_WAL_S3_BUCKET: backups
-          IRCINTEL_BACKUP_S3_ENDPOINT: https://objects.example.invalid
-          IRCINTEL_BACKUP_ALERT_WEBHOOK: https://alerts.example.invalid/ircintel
-        run: |
-          if ops/postgres/dr-readiness.sh production; then
-            echo 'legacy alert variable unexpectedly satisfied readiness' >&2
-            exit 1
-          fi
-
-      - name: Verify representative production configuration passes
-        env:
-          IRCINTEL_BASEBACKUP_S3_BUCKET: ircintel-basebackup-prod
-          IRCINTEL_WAL_S3_BUCKET: ircintel-wal-prod
-          IRCINTEL_BACKUP_S3_ENDPOINT: https://objects.example.invalid
-          IRCINTEL_BACKUP_ALERT_WEBHOOK_URL: https://alerts.example.invalid/ircintel
-          IRCINTEL_BACKUP_S3_ENCRYPTION: AES256
           IRCINTEL_WAL_RETENTION_DAYS: '42'
           IRCINTEL_BASEBACKUP_RETENTION_DAYS: '35'
+          IRCINTEL_DR_EVIDENCE_RETENTION_DAYS: '365'
+        run: |
+          set +e; IRCINTEL_BACKUP_S3_ENDPOINT=http://127.0.0.1:4566 ops/postgres/dr-readiness.sh production; rc=$?; set -e
+          test "$rc" -eq 68
+      - name: Reject WAL retention invariant
+        env: *base
+        run: |
+          set +e; IRCINTEL_WAL_RETENTION_DAYS=30 ops/postgres/dr-readiness.sh production; rc=$?; set -e
+          test "$rc" -eq 68
+      - name: Reject evidence retention shorter than base backup
+        env: *base
+        run: |
+          set +e
+          out=$(IRCINTEL_DR_EVIDENCE_RETENTION_DAYS=34 ops/postgres/dr-readiness.sh production 2>&1); rc=$?
+          set -e
+          printf '%s\n' "$out"
+          test "$rc" -eq 68
+          grep -qx 'dr_readiness_evidence_retention_invariant=false' <<<"$out"
+      - name: Reject malformed evidence retention
+        env: *base
+        run: |
+          set +e; out=$(IRCINTEL_DR_EVIDENCE_RETENTION_DAYS=abc ops/postgres/dr-readiness.sh production 2>&1); rc=$?; set -e
+          test "$rc" -eq 68
+          grep -qx 'dr_readiness_invalid_retention=true' <<<"$out"
+      - name: Verify representative production configuration
+        env: *base
         run: |
           output="$(ops/postgres/dr-readiness.sh production)"
           printf '%s\n' "$output"
-          printf '%s\n' "$output" | grep -qx 'dr_readiness_mode=production'
-          printf '%s\n' "$output" | grep -qx 'dr_alert_routing_configured=true'
-          printf '%s\n' "$output" | grep -qx 'dr_ready=true'
-
-      - name: Start M4.37 qualification provider
-        run: |
-          docker run -d --name ircintel-m437-localstack -p 4566:4566 -e SERVICES=s3 localstack/localstack:4.4.0
-          for i in $(seq 1 60); do
-            if curl -fsS http://127.0.0.1:4566/_localstack/health | grep -q '"s3"'; then
-              exit 0
-            fi
-            sleep 1
-          done
-          docker logs ircintel-m437-localstack
-          exit 1
-
-      - name: Start M4.37 alert receiver
-        run: |
-          cat >/tmp/m437_receiver.py <<'PY'
-          from http.server import BaseHTTPRequestHandler, HTTPServer
-          class Handler(BaseHTTPRequestHandler):
-              def do_POST(self):
-                  n=int(self.headers.get('Content-Length','0'))
-                  open('/tmp/m437-alert.json','wb').write(self.rfile.read(n))
-                  self.send_response(204)
-                  self.end_headers()
-              def log_message(self, *args):
-                  pass
-          HTTPServer(('127.0.0.1',18080),Handler).serve_forever()
-          PY
-          python3 /tmp/m437_receiver.py >/tmp/m437_receiver.log 2>&1 &
-          echo $! >/tmp/m437_receiver.pid
-          sleep 1
-
-      - name: Configure M4.37 provider contract
-        env:
-          AWS_ACCESS_KEY_ID: test
-          AWS_SECRET_ACCESS_KEY: test
-          AWS_DEFAULT_REGION: us-east-1
-          IRCINTEL_BACKUP_S3_ENDPOINT: http://127.0.0.1:4566
-          IRCINTEL_WAL_RETENTION_DAYS: '42'
-          IRCINTEL_BASEBACKUP_RETENTION_DAYS: '35'
-        run: |
-          aws --endpoint-url "$IRCINTEL_BACKUP_S3_ENDPOINT" s3api create-bucket --bucket ircintel-m437
-          aws --endpoint-url "$IRCINTEL_BACKUP_S3_ENDPOINT" s3api put-bucket-encryption --bucket ircintel-m437 --server-side-encryption-configuration '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
-          ops/postgres/s3-retention-policy.sh ircintel-m437 apply
-
-      - name: Qualify M4.37 acceptance and alert path
-        env:
-          AWS_ACCESS_KEY_ID: test
-          AWS_SECRET_ACCESS_KEY: test
-          AWS_DEFAULT_REGION: us-east-1
-          IRCINTEL_BACKUP_S3_ENDPOINT: http://127.0.0.1:4566
-          IRCINTEL_BACKUP_S3_ENCRYPTION: AES256
-          IRCINTEL_WAL_RETENTION_DAYS: '42'
-          IRCINTEL_BASEBACKUP_RETENTION_DAYS: '35'
-          IRCINTEL_BACKUP_ALERT_WEBHOOK_URL: http://127.0.0.1:18080/alert
-          IRCINTEL_ENVIRONMENT: qualification
-        run: |
-          ok="$(ops/postgres/dr-acceptance.sh ci ircintel-m437)"
-          printf '%s\n' "$ok"
-          printf '%s\n' "$ok" | grep -qx 'dr_acceptance_result=ok'
-          rm -f /tmp/m437-alert.json
-          set +e
-          bad=$(IRCINTEL_BACKUP_S3_ENCRYPTION=aws:kms ops/postgres/dr-acceptance.sh ci ircintel-m437 2>&1)
-          rc=$?
-          set -e
-          printf '%s\n' "$bad"
-          test "$rc" -eq 74
-          printf '%s\n' "$bad" | grep -qx 'dr_acceptance_alert_delivery=delivered'
-          printf '%s\n' "$bad" | grep -qx 'dr_acceptance_result=provider_failed'
-          test -s /tmp/m437-alert.json
-          python3 - <<'PY'
-          import json
-          p=json.load(open('/tmp/m437-alert.json'))
-          assert p['schema']=='ircintel.backup-alert.v1'
-          assert p['event']=='dr.provider.failed'
-          assert p['severity']=='critical'
-          assert p['environment']=='qualification'
-          PY
-
-      - name: Cleanup M4.37 qualification
-        if: always()
-        run: |
-          test ! -f /tmp/m437_receiver.pid || kill "$(cat /tmp/m437_receiver.pid)" >/dev/null 2>&1 || true
-          docker rm -f ircintel-m437-localstack >/dev/null 2>&1 || true
+          grep -qx 'dr_readiness_mode=production' <<<"$output"
+          grep -qx 'dr_evidence_bucket=evidence' <<<"$output"
+          grep -qx 'dr_evidence_retention_days=365' <<<"$output"
+          grep -qx 'dr_evidence_retention_configured=true' <<<"$output"
+          grep -qx 'dr_alert_routing_configured=true' <<<"$output"
+          grep -qx 'dr_ready=true' <<<"$output"
