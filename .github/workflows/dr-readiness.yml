@@ -29,7 +29,7 @@ jobs:
           set +e; ops/postgres/dr-readiness.sh production; rc=$?; set -e
           test "$rc" -eq 68
       - name: Reject unsafe local endpoint
-        env: &base
+        env:
           IRCINTEL_BASEBACKUP_S3_BUCKET: backups
           IRCINTEL_WAL_S3_BUCKET: backups
           IRCINTEL_DR_EVIDENCE_S3_BUCKET: evidence
@@ -42,12 +42,28 @@ jobs:
           set +e; IRCINTEL_BACKUP_S3_ENDPOINT=http://127.0.0.1:4566 ops/postgres/dr-readiness.sh production; rc=$?; set -e
           test "$rc" -eq 68
       - name: Reject WAL retention invariant
-        env: *base
+        env:
+          IRCINTEL_BASEBACKUP_S3_BUCKET: backups
+          IRCINTEL_WAL_S3_BUCKET: backups
+          IRCINTEL_DR_EVIDENCE_S3_BUCKET: evidence
+          IRCINTEL_BACKUP_S3_ENDPOINT: https://objects.example.invalid
+          IRCINTEL_BACKUP_ALERT_WEBHOOK_URL: https://alerts.example.invalid/ircintel
+          IRCINTEL_WAL_RETENTION_DAYS: '42'
+          IRCINTEL_BASEBACKUP_RETENTION_DAYS: '35'
+          IRCINTEL_DR_EVIDENCE_RETENTION_DAYS: '365'
         run: |
           set +e; IRCINTEL_WAL_RETENTION_DAYS=30 ops/postgres/dr-readiness.sh production; rc=$?; set -e
           test "$rc" -eq 68
       - name: Reject evidence retention shorter than base backup
-        env: *base
+        env:
+          IRCINTEL_BASEBACKUP_S3_BUCKET: backups
+          IRCINTEL_WAL_S3_BUCKET: backups
+          IRCINTEL_DR_EVIDENCE_S3_BUCKET: evidence
+          IRCINTEL_BACKUP_S3_ENDPOINT: https://objects.example.invalid
+          IRCINTEL_BACKUP_ALERT_WEBHOOK_URL: https://alerts.example.invalid/ircintel
+          IRCINTEL_WAL_RETENTION_DAYS: '42'
+          IRCINTEL_BASEBACKUP_RETENTION_DAYS: '35'
+          IRCINTEL_DR_EVIDENCE_RETENTION_DAYS: '365'
         run: |
           set +e
           out=$(IRCINTEL_DR_EVIDENCE_RETENTION_DAYS=34 ops/postgres/dr-readiness.sh production 2>&1); rc=$?
@@ -56,13 +72,29 @@ jobs:
           test "$rc" -eq 68
           grep -qx 'dr_readiness_evidence_retention_invariant=false' <<<"$out"
       - name: Reject malformed evidence retention
-        env: *base
+        env:
+          IRCINTEL_BASEBACKUP_S3_BUCKET: backups
+          IRCINTEL_WAL_S3_BUCKET: backups
+          IRCINTEL_DR_EVIDENCE_S3_BUCKET: evidence
+          IRCINTEL_BACKUP_S3_ENDPOINT: https://objects.example.invalid
+          IRCINTEL_BACKUP_ALERT_WEBHOOK_URL: https://alerts.example.invalid/ircintel
+          IRCINTEL_WAL_RETENTION_DAYS: '42'
+          IRCINTEL_BASEBACKUP_RETENTION_DAYS: '35'
+          IRCINTEL_DR_EVIDENCE_RETENTION_DAYS: '365'
         run: |
           set +e; out=$(IRCINTEL_DR_EVIDENCE_RETENTION_DAYS=abc ops/postgres/dr-readiness.sh production 2>&1); rc=$?; set -e
           test "$rc" -eq 68
           grep -qx 'dr_readiness_invalid_retention=true' <<<"$out"
       - name: Verify representative production configuration
-        env: *base
+        env:
+          IRCINTEL_BASEBACKUP_S3_BUCKET: backups
+          IRCINTEL_WAL_S3_BUCKET: backups
+          IRCINTEL_DR_EVIDENCE_S3_BUCKET: evidence
+          IRCINTEL_BACKUP_S3_ENDPOINT: https://objects.example.invalid
+          IRCINTEL_BACKUP_ALERT_WEBHOOK_URL: https://alerts.example.invalid/ircintel
+          IRCINTEL_WAL_RETENTION_DAYS: '42'
+          IRCINTEL_BASEBACKUP_RETENTION_DAYS: '35'
+          IRCINTEL_DR_EVIDENCE_RETENTION_DAYS: '365'
         run: |
           output="$(ops/postgres/dr-readiness.sh production)"
           printf '%s\n' "$output"
