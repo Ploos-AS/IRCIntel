@@ -1,0 +1,73 @@
+name: DR Evidence Manifest
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  manifest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build verified fixture
+        run: |
+          chmod +x ops/postgres/dr-evidence-manifest.sh
+          printf '%s\n' '{"schema":"ircintel.dr-acceptance-record.v1","mode":"ci","result":"ok","exit_code":0}' > /tmp/evidence.json
+          sha=$(sha256sum /tmp/evidence.json | awk '{print $1}')
+          size=$(stat -c %s /tmp/evidence.json)
+          python3 - "$sha" "$size" > /tmp/restore.json <<'PY'
+          import json,sys
+          print(json.dumps({"schema":"ircintel.dr-evidence-restore.v1","source_key":"postgres/dr-evidence/test.json","restored_sha256":sys.argv[1],"restored_size_bytes":int(sys.argv[2]),"archive_kind":"ircintel-dr-acceptance-evidence","archive_mode":"ci","archive_result":"ok","metadata_verified":True,"result":"ok"},separators=(',',':')))
+          PY
+      - name: Create and verify manifest
+        run: |
+          out=$(ops/postgres/dr-evidence-manifest.sh /tmp/evidence.json postgres/dr-evidence/test.json /tmp/restore.json /tmp/manifest.json)
+          printf '%s\n' "$out"
+          grep -q '^dr_evidence_manifest_result=ok$' <<<"$out"
+          python3 - /tmp/manifest.json <<'PY'
+          import json,sys
+          x=json.load(open(sys.argv[1]))
+          assert x['schema']=='ircintel.dr-evidence-manifest.v1'
+          assert x['evidence_key']=='postgres/dr-evidence/test.json'
+          assert x['mode']=='ci' and x['acceptance_result']=='ok'
+          assert x['metadata_verified'] is True and x['restore_verified'] is True
+          assert x['result']=='ok'
+          PY
+      - name: Reject hash mismatch
+        run: |
+          python3 - /tmp/restore.json > /tmp/bad-hash.json <<'PY'
+          import json,sys
+          x=json.load(open(sys.argv[1])); x['restored_sha256']='0'*64; print(json.dumps(x))
+          PY
+          set +e
+          ops/postgres/dr-evidence-manifest.sh /tmp/evidence.json postgres/dr-evidence/test.json /tmp/bad-hash.json /tmp/no.json
+          rc=$?
+          set -e
+          test "$rc" -eq 74
+      - name: Reject key mismatch
+        run: |
+          set +e
+          ops/postgres/dr-evidence-manifest.sh /tmp/evidence.json postgres/dr-evidence/other.json /tmp/restore.json /tmp/no.json
+          rc=$?
+          set -e
+          test "$rc" -eq 74
+      - name: Reject unverified restore
+        run: |
+          python3 - /tmp/restore.json > /tmp/unverified.json <<'PY'
+          import json,sys
+          x=json.load(open(sys.argv[1])); x['metadata_verified']=False; print(json.dumps(x))
+          PY
+          set +e
+          ops/postgres/dr-evidence-manifest.sh /tmp/evidence.json postgres/dr-evidence/test.json /tmp/unverified.json /tmp/no.json
+          rc=$?
+          set -e
+          test "$rc" -eq 74
+      - uses: actions/upload-artifact@v4
+        with:
+          name: m4-45-dr-evidence-manifest
+          path: /tmp/manifest.json
