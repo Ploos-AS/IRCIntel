@@ -31,28 +31,20 @@ key=$(grep '^dr_evidence_archive_key=' "$log" | tail -1 | cut -d= -f2-)
 [[ -n "$record" && -f "$record" ]] || { echo "dr_integrity_chain_result=record_missing" >&2; exit 66; }
 [[ -n "$key" ]] || { echo "dr_integrity_chain_result=archive_key_missing" >&2; exit 66; }
 
-endpoint=${IRCINTEL_DR_EVIDENCE_S3_ENDPOINT:-${IRCINTEL_BACKUP_S3_ENDPOINT:-${IRCINTEL_BASEBACKUP_S3_ENDPOINT:-}}}
-aws_args=()
-[[ -n "$endpoint" ]] && aws_args+=(--endpoint-url "$endpoint")
+restore="$evidence_dir/dr-evidence-restore.json"
+manifest="$evidence_dir/dr-evidence-manifest.json"
+ops/postgres/dr-evidence-restore-verify.sh "$bucket" "$key" "$restore"
+ops/postgres/dr-evidence-manifest.sh "$record" "$key" "$restore" "$manifest"
+ops/postgres/dr-evidence-manifest-verify.sh "$manifest" "$record" "$restore"
 
 sha=$(sha256sum "$record" | awk '{print $1}')
-tmp=$(mktemp)
-trap 'rm -f "$tmp"' EXIT
-
-aws "${aws_args[@]}" s3api get-object --bucket "$bucket" --key "$key" "$tmp" >/dev/null
-download_sha=$(sha256sum "$tmp" | awk '{print $1}')
-[[ "$download_sha" == "$sha" ]] || { echo "dr_integrity_chain_result=sha256_mismatch" >&2; exit 74; }
-
-python3 - "$record" "$tmp" <<'PY'
-import json,sys
-local=json.load(open(sys.argv[1],encoding='utf-8'))
-remote=json.load(open(sys.argv[2],encoding='utf-8'))
-assert local == remote, 'restored evidence differs from source'
-assert local['schema'] == 'ircintel.dr-acceptance-record.v1'
-assert local['result'] == 'ok'
-PY
+manifest_sha=$(sha256sum "$manifest" | awk '{print $1}')
 
 echo "dr_integrity_chain_result=ok"
 echo "dr_integrity_chain_record=$record"
 echo "dr_integrity_chain_key=$key"
 echo "dr_integrity_chain_sha256=$sha"
+echo "dr_integrity_chain_restore=$restore"
+echo "dr_integrity_chain_manifest=$manifest"
+echo "dr_integrity_chain_manifest_sha256=$manifest_sha"
+echo "dr_integrity_chain_manifest_verified=true"
