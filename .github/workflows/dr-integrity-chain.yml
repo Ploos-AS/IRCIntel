@@ -46,57 +46,50 @@ jobs:
           aws --endpoint-url "$IRCINTEL_BACKUP_S3_ENDPOINT" s3api put-bucket-encryption --bucket "$IRCINTEL_DR_EVIDENCE_S3_BUCKET" --server-side-encryption-configuration '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
           chmod +x ops/postgres/*.sh
           ops/postgres/s3-retention-policy.sh "$IRCINTEL_DR_EVIDENCE_S3_BUCKET" apply
-      - name: Run M4.52 chain
+      - name: Run M4.53 chain
         run: |
-          mkdir -p build/qualification/m4-52
-          ops/postgres/dr-integrity-chain.sh ci "$IRCINTEL_DR_EVIDENCE_S3_BUCKET" build/qualification/m4-52 | tee build/qualification/m4-52/chain-run.log
-      - name: Verify off-host audit bundle
+          mkdir -p build/qualification/m4-53
+          ops/postgres/dr-integrity-chain.sh ci "$IRCINTEL_DR_EVIDENCE_S3_BUCKET" build/qualification/m4-53 | tee build/qualification/m4-53/chain-run.log
+      - name: Verify audit bundle restore record
         run: |
           set -euo pipefail
-          log=build/qualification/m4-52/chain-run.log
-          grep -qx 'dr_integrity_chain_audit_bundle_verified=true' "$log"
-          grep -qx 'dr_integrity_chain_audit_bundle_archived=true' "$log"
-          bundle=$(grep '^dr_integrity_chain_audit_bundle=' "$log"|tail -1|cut -d= -f2-)
+          log=build/qualification/m4-53/chain-run.log
+          grep -qx 'dr_integrity_chain_audit_bundle_restore_verified=true' "$log"
+          restore=$(grep '^dr_integrity_chain_audit_bundle_restore=' "$log"|tail -1|cut -d= -f2-)
           key=$(grep '^dr_integrity_chain_audit_bundle_archive_key=' "$log"|tail -1|cut -d= -f2-)
-          sha=$(sha256sum "$bundle"|awk '{print $1}')
+          python3 - "$restore" "$key" <<'PY'
+          import json,sys
+          d=json.load(open(sys.argv[1]))
+          assert d['schema']=='ircintel.dr-audit-bundle-restore.v1'
+          assert d['result']=='ok' and d['metadata_verified'] is True and d['bundle_verified'] is True
+          assert d['source_key']==sys.argv[2]
+          for k in ('audit_bundle_sha256','evidence_sha256','manifest_sha256'):
+              assert len(d[k])==64
+          PY
+      - name: Prove audit metadata tamper detection
+        run: |
+          set -euo pipefail
+          log=build/qualification/m4-53/chain-run.log
+          key=$(grep '^dr_integrity_chain_audit_bundle_archive_key=' "$log"|tail -1|cut -d= -f2-)
           head=$(aws --endpoint-url "$IRCINTEL_DR_EVIDENCE_S3_ENDPOINT" s3api head-object --bucket "$IRCINTEL_DR_EVIDENCE_S3_BUCKET" --key "$key" --output json)
-          python3 - "$head" "$sha" <<'PY'
-          import json,sys
-          m=json.loads(sys.argv[1]).get('Metadata',{})
-          assert m['kind']=='ircintel-dr-audit-bundle'
-          assert m['sha256']==sys.argv[2]
-          assert len(m['evidence-sha256'])==64 and len(m['manifest-sha256'])==64
-          PY
-          aws --endpoint-url "$IRCINTEL_DR_EVIDENCE_S3_ENDPOINT" s3api get-object --bucket "$IRCINTEL_DR_EVIDENCE_S3_BUCKET" --key "$key" build/qualification/m4-52/restored-audit-bundle.json >/dev/null
-          test "$(sha256sum build/qualification/m4-52/restored-audit-bundle.json|awk '{print $1}')" = "$sha"
-      - name: Prove audit bundle archive idempotency
-        run: |
-          set -euo pipefail
-          bundle=$(grep '^dr_integrity_chain_audit_bundle=' build/qualification/m4-52/chain-run.log|tail -1|cut -d= -f2-)
-          out=$(ops/postgres/dr-audit-bundle-s3.sh "$bundle")
-          printf '%s\n' "$out"
-          grep -qx 'dr_audit_bundle_archive_result=already_present' <<<"$out"
-      - name: Prove invalid bundle rejection
-        run: |
-          set -euo pipefail
-          bundle=$(grep '^dr_integrity_chain_audit_bundle=' build/qualification/m4-52/chain-run.log|tail -1|cut -d= -f2-)
-          cp "$bundle" build/qualification/m4-52/tampered-audit-bundle.json
-          python3 - build/qualification/m4-52/tampered-audit-bundle.json <<'PY'
-          import json,sys
-          p=sys.argv[1]; d=json.load(open(p)); d['chain_verified']=False
-          json.dump(d,open(p,'w'),sort_keys=True,separators=(',',':'))
-          PY
+          tmp=build/qualification/m4-53/tamper-source.json
+          aws --endpoint-url "$IRCINTEL_DR_EVIDENCE_S3_ENDPOINT" s3api get-object --bucket "$IRCINTEL_DR_EVIDENCE_S3_BUCKET" --key "$key" "$tmp" >/dev/null
+          sha=$(sha256sum "$tmp"|awk '{print $1}'); size=$(stat -c '%s' "$tmp")
+          mode=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["mode"])' "$tmp")
+          result=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["acceptance_result"])' "$tmp")
+          evidence=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["evidence_sha256"])' "$tmp")
+          aws --endpoint-url "$IRCINTEL_DR_EVIDENCE_S3_ENDPOINT" s3api put-object --bucket "$IRCINTEL_DR_EVIDENCE_S3_BUCKET" --key "$key" --body "$tmp" --metadata "sha256=$sha,size-bytes=$size,kind=ircintel-dr-audit-bundle,mode=$mode,result=$result,evidence-sha256=$evidence,manifest-sha256=$(printf '0%.0s' {1..64})" >/dev/null
           set +e
-          ops/postgres/dr-audit-bundle-s3.sh build/qualification/m4-52/tampered-audit-bundle.json
+          ops/postgres/dr-audit-bundle-restore-verify.sh "$IRCINTEL_DR_EVIDENCE_S3_BUCKET" "$key" build/qualification/m4-53/tampered-restore.json
           rc=$?
           set -e
-          test "$rc" -eq 65
-      - name: Upload M4.52 evidence
+          test "$rc" -eq 74
+      - name: Upload M4.53 evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: m4-52-offhost-dr-audit-bundle
-          path: build/qualification/m4-52/
+          name: m4-53-dr-audit-bundle-restore
+          path: build/qualification/m4-53/
           retention-days: 30
       - name: Cleanup
         if: always()
