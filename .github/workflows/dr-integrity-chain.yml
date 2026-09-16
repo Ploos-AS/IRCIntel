@@ -2,19 +2,12 @@ name: DR Integrity Chain
 
 on:
   push:
-    branches: [main]
-    paths:
-      - '.github/workflows/dr-integrity-chain.yml'
-      - 'ops/postgres/dr-integrity-chain.sh'
-      - 'ops/postgres/dr-evidence-manifest-s3.sh'
-      - 'ops/postgres/dr-evidence-manifest.sh'
-      - 'ops/postgres/dr-evidence-manifest-verify.sh'
-      - 'docs/M4_49_OFFHOST_DR_MANIFEST_ARCHIVE.md'
   pull_request:
-    branches: [main]
   workflow_dispatch:
+
 permissions:
   contents: read
+
 jobs:
   integrity-chain:
     runs-on: ubuntu-24.04
