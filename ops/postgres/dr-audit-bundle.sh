@@ -20,6 +20,7 @@ def sha(p):
     return h.hexdigest()
 r,er,m,mr=map(load,paths)
 try:
+    evidence_restore_sha=er.get('evidence_sha256',er.get('restored_sha256'))
     checks=[
       r.get('schema')=='ircintel.dr-acceptance-record.v1',
       m.get('schema')=='ircintel.dr-evidence-manifest.v1', m.get('result')=='ok',
@@ -27,7 +28,7 @@ try:
       er.get('schema')=='ircintel.dr-evidence-restore.v1', er.get('result')=='ok', er.get('metadata_verified') is True,
       m.get('evidence_sha256')==sha(paths[0]),
       m.get('evidence_key')==er.get('source_key')==mr.get('evidence_key'),
-      m.get('evidence_sha256')==er.get('evidence_sha256')==mr.get('evidence_sha256'),
+      m.get('evidence_sha256')==evidence_restore_sha==mr.get('evidence_sha256'),
       mr.get('manifest_sha256')==sha(paths[2]),
       mr.get('mode')==m.get('mode'), mr.get('acceptance_result')==m.get('acceptance_result'),
     ]
