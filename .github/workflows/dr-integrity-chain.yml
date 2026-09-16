@@ -4,10 +4,8 @@ on:
   push:
   pull_request:
   workflow_dispatch:
-
 permissions:
   contents: read
-
 jobs:
   integrity-chain:
     runs-on: ubuntu-24.04
@@ -48,33 +46,40 @@ jobs:
           aws --endpoint-url "$IRCINTEL_BACKUP_S3_ENDPOINT" s3api put-bucket-encryption --bucket "$IRCINTEL_DR_EVIDENCE_S3_BUCKET" --server-side-encryption-configuration '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
           chmod +x ops/postgres/*.sh
           ops/postgres/s3-retention-policy.sh "$IRCINTEL_DR_EVIDENCE_S3_BUCKET" apply
-      - name: Run M4.49 chain
+      - name: Run M4.50 chain
         run: |
-          mkdir -p build/qualification/m4-49
-          ops/postgres/dr-integrity-chain.sh ci "$IRCINTEL_DR_EVIDENCE_S3_BUCKET" build/qualification/m4-49 | tee build/qualification/m4-49/chain-run.log
-      - name: Verify off-host manifest
+          mkdir -p build/qualification/m4-50
+          ops/postgres/dr-integrity-chain.sh ci "$IRCINTEL_DR_EVIDENCE_S3_BUCKET" build/qualification/m4-50 | tee build/qualification/m4-50/chain-run.log
+      - name: Verify manifest restore record
         run: |
           set -euo pipefail
-          log=build/qualification/m4-49/chain-run.log
-          grep -qx 'dr_integrity_chain_manifest_archived=true' "$log"
-          key=$(grep '^dr_integrity_chain_manifest_archive_key=' "$log"|tail -1|cut -d= -f2-)
-          manifest=$(grep '^dr_integrity_chain_manifest=' "$log"|tail -1|cut -d= -f2-)
-          expected=$(sha256sum "$manifest"|awk '{print $1}')
-          head=$(aws --endpoint-url "$IRCINTEL_BACKUP_S3_ENDPOINT" s3api head-object --bucket "$IRCINTEL_DR_EVIDENCE_S3_BUCKET" --key "$key" --output json)
-          test "$(printf '%s' "$head"|python3 -c 'import json,sys;print(json.load(sys.stdin)["Metadata"]["kind"])')" = ircintel-dr-evidence-manifest
-          test "$(printf '%s' "$head"|python3 -c 'import json,sys;print(json.load(sys.stdin)["Metadata"]["sha256"])')" = "$expected"
-          aws --endpoint-url "$IRCINTEL_BACKUP_S3_ENDPOINT" s3api get-object --bucket "$IRCINTEL_DR_EVIDENCE_S3_BUCKET" --key "$key" build/qualification/m4-49/restored-manifest.json >/dev/null
-          test "$(sha256sum build/qualification/m4-49/restored-manifest.json|awk '{print $1}')" = "$expected"
-      - name: Prove archive idempotency
+          log=build/qualification/m4-50/chain-run.log
+          grep -qx 'dr_integrity_chain_manifest_restore_verified=true' "$log"
+          record=$(grep '^dr_integrity_chain_manifest_restore=' "$log"|tail -1|cut -d= -f2-)
+          python3 - "$record" <<'PY'
+          import json,sys
+          d=json.load(open(sys.argv[1]))
+          assert d['schema']=='ircintel.dr-evidence-manifest-restore.v1'
+          assert d['result']=='ok' and d['metadata_verified'] is True
+          assert len(d['manifest_sha256'])==64 and len(d['evidence_sha256'])==64
+          PY
+      - name: Prove tamper detection
         run: |
-          manifest=$(grep '^dr_integrity_chain_manifest=' build/qualification/m4-49/chain-run.log|tail -1|cut -d= -f2-)
-          ops/postgres/dr-evidence-manifest-s3.sh "$manifest" | grep -qx 'dr_manifest_archive_result=already_present'
-      - name: Upload M4.49 evidence
+          set -euo pipefail
+          log=build/qualification/m4-50/chain-run.log
+          key=$(grep '^dr_integrity_chain_manifest_archive_key=' "$log"|tail -1|cut -d= -f2-)
+          aws --endpoint-url "$IRCINTEL_BACKUP_S3_ENDPOINT" s3api copy-object --bucket "$IRCINTEL_DR_EVIDENCE_S3_BUCKET" --copy-source "$IRCINTEL_DR_EVIDENCE_S3_BUCKET/$key" --key tampered-manifest.json --metadata-directive REPLACE --metadata 'sha256=0000000000000000000000000000000000000000000000000000000000000000,size-bytes=1,kind=ircintel-dr-evidence-manifest,mode=ci,result=ok,evidence-sha256=0000000000000000000000000000000000000000000000000000000000000000' >/dev/null
+          set +e
+          ops/postgres/dr-evidence-manifest-restore-verify.sh "$IRCINTEL_DR_EVIDENCE_S3_BUCKET" tampered-manifest.json build/qualification/m4-50/tampered.json
+          rc=$?
+          set -e
+          test "$rc" -eq 74
+      - name: Upload M4.50 evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: m4-49-offhost-dr-manifest-archive
-          path: build/qualification/m4-49/
+          name: m4-50-dr-manifest-restore-verification
+          path: build/qualification/m4-50/
           retention-days: 30
       - name: Cleanup
         if: always()
